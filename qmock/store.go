@@ -17,15 +17,17 @@ type SimpleFileStore struct {
 	dir      string
 	token    string
 	hostname string
+	roles    []string
 	mu       sync.RWMutex
 	sig      chan struct{}
 }
 
-func NewSimpleFileStore(dir string, token string, hostname string) *SimpleFileStore {
+func NewSimpleFileStore(dir string, token string, hostname string, roles ...string) *SimpleFileStore {
 	return &SimpleFileStore{
 		dir:      dir,
 		token:    token,
 		hostname: hostname,
+		roles:    roles,
 	}
 }
 
@@ -45,7 +47,7 @@ func (s *SimpleFileStore) GetIdentity() (qdef.Identity, error) {
 	data, err := os.ReadFile(filepath.Join(s.dir, "identity.json"))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return qdef.Identity{Hostname: s.hostname}, nil
+			return qdef.Identity{Hostname: s.hostname, Roles: s.roles}, nil
 		}
 		return qdef.Identity{}, qdef.ErrCredentialsMissing
 	}

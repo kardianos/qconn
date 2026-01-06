@@ -63,11 +63,19 @@ func TestSimpleClientAPI(t *testing.T) {
 	serverAddr := "localhost:" + port
 
 	go server.Serve(ctx, packetConn)
+	hub.SetRoleDef("requester", anex.RoleConfig{
+		SendsTo: []string{"printer"},
+	})
+	hub.SetRoleDef("provider", anex.RoleConfig{
+		Provides: []string{"printer"},
+	})
+	hub.SetStaticAuthorization("requester-01", []string{"requester"})
+	hub.SetStaticAuthorization("provider-01", []string{"provider"})
 
 	// 2. Setup Provider
 	provDir, _ := os.MkdirTemp("", "qconn-prov-*")
 	defer os.RemoveAll(provDir)
-	provStore := qmock.NewSimpleFileStore(provDir, "secret-token", "provider-01")
+	provStore := qmock.NewSimpleFileStore(provDir, "secret-token", "provider-01", "provider")
 	provStore.SetRootCA(qdef.EncodeCertPEM(auth.RootCert()))
 
 	provClient := NewClient(serverAddr, provStore)
@@ -87,7 +95,7 @@ func TestSimpleClientAPI(t *testing.T) {
 	// 3. Setup Requester
 	reqDir, _ := os.MkdirTemp("", "qconn-req-*")
 	defer os.RemoveAll(reqDir)
-	reqStore := qmock.NewSimpleFileStore(reqDir, secretToken, "requester-01")
+	reqStore := qmock.NewSimpleFileStore(reqDir, secretToken, "requester-01", "requester")
 	reqStore.SetRootCA(qdef.EncodeCertPEM(auth.RootCert()))
 
 	reqClient := NewClient(serverAddr, reqStore)

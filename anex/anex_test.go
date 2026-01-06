@@ -32,6 +32,14 @@ func TestAnexRouting(t *testing.T) {
 		Observer: qmock.NewTestObserver(ctx, t),
 	})
 
+	hub.SetRoleDef("printer-provider", RoleConfig{
+		Provides: []string{"printer"},
+	})
+	// Allow hub itself (no roles in context) to send to any job type?
+	// Actually, let's just make it possible to send if no sender roles are present for now,
+	// or configure the hub's request to have a role.
+	// For simplicity, I'll allow "provide" if no role def exists or if explicitly allowed.
+
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -43,9 +51,10 @@ func TestAnexRouting(t *testing.T) {
 	go server.Serve(ctx, packetConn)
 
 	// 3. Setup Provider Client.
-	clientID := qdef.Identity{Hostname: "provider-01"}
+	clientID := qdef.Identity{Hostname: "provider-01", Roles: []string{"printer-provider"}}
 	clientCertPEM, clientKeyPEM, _ := auth.IssueClientCertificate(&clientID)
 	auth.AuthorizeAll()
+	hub.SetStaticAuthorization(clientID.Fingerprint, []string{"printer-provider"})
 
 	provStore := &mockCredentialStore{
 		id:         clientID,
@@ -132,11 +141,15 @@ type mockCredentialStore struct {
 	certPEM    []byte
 	keyPEM     []byte
 	rootCACert *x509.Certificate
+	token      string
 }
 
 func (s *mockCredentialStore) GetIdentity() (qdef.Identity, error) { return s.id, nil }
-func (s *mockCredentialStore) ProvisionToken() string              { return "" }
+func (s *mockCredentialStore) ProvisionToken() string              { return s.token }
 func (s *mockCredentialStore) GetClientCertificate() (tls.Certificate, error) {
+	if len(s.certPEM) == 0 {
+		return tls.Certificate{}, qdef.ErrCredentialsMissing
+	}
 	return tls.X509KeyPair(s.certPEM, s.keyPEM)
 }
 func (s *mockCredentialStore) GetRootCAs() (*x509.CertPool, error) {

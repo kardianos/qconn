@@ -18,6 +18,9 @@ import (
 var (
 	// OIDProvisioningIdentity is a custom extension to identify provisioning certificates.
 	OIDProvisioningIdentity = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 1}
+
+	// OIDRoles is a custom extension to store roles associated with an identity.
+	OIDRoles = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 2}
 )
 
 // Fingerprint returns the SHA-256 hash of the provided data.
@@ -58,7 +61,7 @@ func CreateCA() (caCert *x509.Certificate, caKey *ecdsa.PrivateKey, err error) {
 
 // CreateCert creates a new certificate signed by the provided CA.
 // It includes the hostname in the Subject Alternative Name (SAN) field for modern TLS validation.
-func CreateCert(caCert *x509.Certificate, caKey *ecdsa.PrivateKey, hostname string, isServer bool) (certPEM []byte, keyPEM []byte, err error) {
+func CreateCert(caCert *x509.Certificate, caKey *ecdsa.PrivateKey, hostname string, roles []string, isServer bool) (certPEM []byte, keyPEM []byte, err error) {
 	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, nil, err
@@ -78,6 +81,16 @@ func CreateCert(caCert *x509.Certificate, caKey *ecdsa.PrivateKey, hostname stri
 	}
 	if isServer {
 		template.ExtKeyUsage = append(template.ExtKeyUsage, x509.ExtKeyUsageServerAuth)
+	}
+	if len(roles) > 0 {
+		roleBytes, err := asn1.Marshal(roles)
+		if err == nil {
+			template.ExtraExtensions = append(template.ExtraExtensions, pkix.Extension{
+				Id:       OIDRoles,
+				Critical: false,
+				Value:    roleBytes,
+			})
+		}
 	}
 
 	certBytes, err := x509.CreateCertificate(rand.Reader, template, caCert, &privKey.PublicKey, caKey)
@@ -185,4 +198,17 @@ func GenerateProvisioningIdentity(ca tls.Certificate) (tls.Certificate, error) {
 	}
 
 	return leafCert, nil
+}
+
+// ExtractRolesFromCert pulls the roles from the custom X.509 extension.
+func ExtractRolesFromCert(cert *x509.Certificate) []string {
+	for _, ext := range cert.Extensions {
+		if ext.Id.Equal(OIDRoles) {
+			var roles []string
+			if _, err := asn1.Unmarshal(ext.Value, &roles); err == nil {
+				return roles
+			}
+		}
+	}
+	return nil
 }

@@ -225,15 +225,22 @@ func (s *Server) acceptLoop(ctx context.Context, listener *quic.Listener) {
 }
 
 func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	cs := conn.ConnectionState()
 	pcList := cs.TLS.PeerCertificates
 	if len(pcList) == 0 {
 		return fmt.Errorf("client disconnected: no peer certificates")
 	}
 	leaf := pcList[0]
+
+	remoteAddr := conn.RemoteAddr().String()
 	id := qdef.Identity{
 		Hostname:    leaf.Subject.CommonName,
+		Address:     remoteAddr,
 		Fingerprint: fmt.Sprintf("%x", qdef.Fingerprint(leaf.Raw)),
+		Roles:       qdef.ExtractRolesFromCert(leaf),
 	}
 
 	s.notifyState(id, qdef.StateConnected)
@@ -333,6 +340,9 @@ func (s *Server) handleRenewal(ctx context.Context, id qdef.Identity, _ *struct{
 }
 
 func (s *Server) handleProvisioning(ctx context.Context, id qdef.Identity, req *qdef.Identity) (*qdef.CredentialResponse, error) {
+	// Filter roles based on what's allowed.
+	req.Roles = s.authManager.AuthorizeRoles(req.Fingerprint, req.Hostname, req.Roles)
+
 	certPEM, keyPEM, err := s.authManager.IssueClientCertificate(req)
 	if err != nil {
 		return nil, err

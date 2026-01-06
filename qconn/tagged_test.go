@@ -34,7 +34,8 @@ func TestTagged(t *testing.T) {
 	}
 
 	// Encode: Library adds tag based on type
-	msg := MessageA{Field: "hello"}
+	const wantMessage = "hello"
+	msg := MessageA{Field: wantMessage}
 	data, err := em.Marshal(msg) // Produces tagged CBOR: tag 100 + map for MessageA
 
 	// Decode to interface{} and type-assert
@@ -44,7 +45,7 @@ func TestTagged(t *testing.T) {
 	switch msg := v.(type) {
 	case MessageA:
 		gotMessageA = true
-		if msg.Field != "hello" {
+		if msg.Field != wantMessage {
 			t.Errorf("incorrect field text %q", msg.Field)
 		}
 	case MessageB:

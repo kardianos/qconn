@@ -102,6 +102,10 @@ func (m *InMemoryAuthorizationManager) Revoke(id qdef.Identity) error {
 	m.trigger(id.Hostname)
 	return nil
 }
+func (m *InMemoryAuthorizationManager) AuthorizeRoles(fingerprint string, hostname string, requested []string) []string {
+	// By default, mock allows all requested roles.
+	return requested
+}
 func (m *InMemoryAuthorizationManager) RenewClientCertificate(id *qdef.Identity) ([]byte, []byte, error) {
 	return m.IssueClientCertificate(id)
 }
@@ -139,10 +143,10 @@ func NewInMemoryCA() (*InMemoryCA, error) {
 	return &InMemoryCA{caCert: cert, caKey: key}, nil
 }
 func (ca *InMemoryCA) IssueClientCertificate(id qdef.Identity) ([]byte, []byte, error) {
-	return qdef.CreateCert(ca.caCert, ca.caKey, id.Hostname, false)
+	return qdef.CreateCert(ca.caCert, ca.caKey, id.Hostname, id.Roles, false)
 }
 func (ca *InMemoryCA) IssueServerCertificate(id qdef.Identity) (tls.Certificate, error) {
-	certPEM, keyPEM, err := qdef.CreateCert(ca.caCert, ca.caKey, id.Hostname, true)
+	certPEM, keyPEM, err := qdef.CreateCert(ca.caCert, ca.caKey, id.Hostname, nil, true)
 	if err != nil {
 		return tls.Certificate{}, err
 	}

@@ -60,6 +60,20 @@ func (c *Client) logf(format string, v ...interface{}) {
 	}
 }
 
+// SetResolver sets the resolver for the client.
+func (c *Client) SetResolver(r Resolver) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.opt.Resolver = r
+}
+
+// SetObserver sets the observer for the client.
+func (c *Client) SetObserver(o qdef.ClientObserver) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.opt.Observer = o
+}
+
 func (c *Client) notifyState(state qdef.ClientState) {
 	if c.opt.Observer != nil {
 		c.opt.Observer.OnStateChange(c.identity, state)

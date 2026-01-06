@@ -82,8 +82,10 @@ func (s ClientState) String() string {
 // Identity represents a host's persistent identity.
 type Identity struct {
 	Hostname    string   `json:"hostname"`
+	Address     string   `json:"address"`
 	Fingerprint string   `json:"fingerprint"`
 	Type        string   `json:"type"`
+	Roles       []string `json:"roles"`
 	Devices     []string `json:"devices"`
 }
 
@@ -158,13 +160,33 @@ type Stream interface {
 }
 
 // GetStatusFromCert is a helper for auth managers (may be moved to an internal package later if needed).
+// AuthorizationManager handles client authorization, role assignment, and certificate issuance.
 type AuthorizationManager interface {
+	// GetStatus returns the current authorization status of a client certificate.
 	GetStatus(cert *x509.Certificate) (ClientStatus, error)
+
+	// GetSignal returns a channel that is closed when the authorization status
+	// for the given certificate changes.
 	GetSignal(cert *x509.Certificate) <-chan struct{}
+
+	// AuthorizeRoles filters a list of requested roles for a client during provisioning.
+	// It may authorize based on the client's fingerprint or hostname.
+	// Returns the list of permitted roles.
+	AuthorizeRoles(fingerprint string, hostname string, requested []string) []string
+
+	// IssueClientCertificate creates a new client certificate for initial provisioning.
 	IssueClientCertificate(id *Identity) (certPEM []byte, keyPEM []byte, err error)
+
+	// RenewClientCertificate creates a new client certificate for an existing identity.
 	RenewClientCertificate(id *Identity) (certPEM []byte, keyPEM []byte, err error)
+
+	// Revoke invalidates the identity, preventing future authorizations or renewals.
 	Revoke(id Identity) error
+
+	// RootCert returns the root CA certificate for the network.
 	RootCert() *x509.Certificate
+
+	// ServerCertificate returns the TLS certificate for the server to use.
 	ServerCertificate() (tls.Certificate, error)
 }
 

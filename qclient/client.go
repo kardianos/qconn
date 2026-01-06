@@ -82,6 +82,16 @@ func NewClient(serverAddr string, store qconn.CredentialStore) *Client {
 	return c
 }
 
+// SetResolver sets a custom resolver for the internal qconn client.
+func (c *Client) SetResolver(r qconn.Resolver) {
+	c.qcClient.SetResolver(r)
+}
+
+// SetObserver sets a custom observer for the internal qconn client.
+func (c *Client) SetObserver(o qdef.ClientObserver) {
+	c.qcClient.SetObserver(o)
+}
+
 // Start begins background processes.
 func (c *Client) Start(ctx context.Context) error {
 	return c.qcClient.Connect(ctx)

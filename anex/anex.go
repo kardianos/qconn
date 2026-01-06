@@ -11,12 +11,27 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+type contextKey int
+
+const (
+	identityKey contextKey = iota
+)
+
+// RoleConfig defines what a role can do.
+type RoleConfig struct {
+	Provides []string // Job types this role provides.
+	SendsTo  []string // Job types this role can send to.
+}
+
 // Hub manages the routing of messages between clients and tracks network state.
 type Hub struct {
 	mu          sync.RWMutex
 	activeConns sync.Map // Map of fingerprint -> *quic.Conn.
 	hostStates  sync.Map // Map of fingerprint -> *qdef.Identity
 	defaultWait time.Duration
+
+	roleDefs             map[string]RoleConfig
+	staticAuthorizations map[string][]string // fingerprint -> allowed roles
 }
 
 func NewHub(defaultWait time.Duration) *Hub {
@@ -24,10 +39,85 @@ func NewHub(defaultWait time.Duration) *Hub {
 		defaultWait = 10 * time.Second
 	}
 	h := &Hub{
-		defaultWait: defaultWait,
+		defaultWait:          defaultWait,
+		roleDefs:             make(map[string]RoleConfig),
+		staticAuthorizations: make(map[string][]string),
 	}
 
 	return h
+}
+
+// SetRoleDef configures a role's capabilities.
+func (h *Hub) SetRoleDef(name string, config RoleConfig) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.roleDefs[name] = config
+}
+
+// SetStaticAuthorization configures which roles a machine is allowed to have.
+func (h *Hub) SetStaticAuthorization(fingerprint string, roles []string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.staticAuthorizations[fingerprint] = roles
+}
+
+// AuthorizeRoles filters requested roles based on static configuration.
+func (h *Hub) AuthorizeRoles(fingerprint string, hostname string, requested []string) []string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	allowed, ok := h.staticAuthorizations[fingerprint]
+	if !ok {
+		allowed, ok = h.staticAuthorizations[hostname]
+		if !ok {
+			return nil
+		}
+	}
+
+	var authorized []string
+	allowedMap := make(map[string]bool)
+	for _, r := range allowed {
+		allowedMap[r] = true
+	}
+
+	for _, req := range requested {
+		if allowedMap[req] {
+			authorized = append(authorized, req)
+		}
+	}
+	return authorized
+}
+
+func (h *Hub) canSend(senderRoles []string, jobType string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	for _, roleName := range senderRoles {
+		if def, ok := h.roleDefs[roleName]; ok {
+			for _, targetJob := range def.SendsTo {
+				if targetJob == jobType {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (h *Hub) canProvide(receiverRoles []string, jobType string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	for _, roleName := range receiverRoles {
+		if def, ok := h.roleDefs[roleName]; ok {
+			for _, providedJob := range def.Provides {
+				if providedJob == jobType {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (h *Hub) RegisterHandlers(r *qdef.StreamRouter) {
@@ -91,6 +181,18 @@ func (h *Hub) Route(ctx context.Context, msg qdef.Message) (*qdef.Message, error
 	for {
 		conn, err := h.findTarget(msg.Target)
 		if err == nil {
+			// Check if sender has permission to send this job type.
+			senderRoles, ok := h.getSenderRoles(ctx)
+			if ok && !h.canSend(senderRoles, msg.Target.Type) {
+				return nil, fmt.Errorf("role %v not authorized to send job type %q", senderRoles, msg.Target.Type)
+			}
+
+			// Check if receiver has permission to provide this job type.
+			receiverRoles := h.getReceiverRoles(msg.Target.Machine)
+			if !h.canProvide(receiverRoles, msg.Target.Type) {
+				return nil, fmt.Errorf("target %q not authorized to provide job type %q", msg.Target.Machine, msg.Target.Type)
+			}
+
 			return h.forward(ctx, conn, msg)
 		}
 
@@ -158,6 +260,8 @@ func (h *Hub) Request(ctx context.Context, target qdef.Addr, payload interface{}
 
 // Handle implements qdef.StreamHandler.
 func (h *Hub) Handle(ctx context.Context, id qdef.Identity, msg qdef.Message, stream qdef.Stream) {
+	ctx = context.WithValue(ctx, identityKey, id)
+
 	if msg.Target.Service == qdef.ServiceUser {
 		resp, err := h.Route(ctx, msg)
 		if err != nil {
@@ -180,6 +284,21 @@ func (h *Hub) Handle(ctx context.Context, id qdef.Identity, msg qdef.Message, st
 		Error: fmt.Sprintf("no handler for %s:%s", msg.Target.Service, msg.Target.Type),
 	}
 	cbor.NewEncoder(stream).Encode(resp)
+}
+
+func (h *Hub) getSenderRoles(ctx context.Context) ([]string, bool) {
+	id, ok := ctx.Value(identityKey).(qdef.Identity)
+	if !ok {
+		return nil, false
+	}
+	return id.Roles, true
+}
+
+func (h *Hub) getReceiverRoles(fingerprint string) []string {
+	if val, ok := h.hostStates.Load(fingerprint); ok {
+		return val.(*qdef.Identity).Roles
+	}
+	return nil
 }
 
 func (h *Hub) handleDeviceUpdate(ctx context.Context, id qdef.Identity, req *qdef.DeviceUpdateRequest) (*struct{}, error) {

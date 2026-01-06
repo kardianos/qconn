@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
@@ -36,29 +37,31 @@ func NewInMemoryAuthorizationManager() *InMemoryAuthorizationManager {
 }
 
 func (m *InMemoryAuthorizationManager) GetSignal(cert *x509.Certificate) <-chan struct{} {
+	fp := qdef.FingerprintHex(cert)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	sig, ok := m.sigs[cert.Subject.CommonName]
+	sig, ok := m.sigs[fp]
 	if !ok {
 		sig = make(chan struct{})
-		m.sigs[cert.Subject.CommonName] = sig
+		m.sigs[fp] = sig
 	}
 	return sig
 }
 
-func (m *InMemoryAuthorizationManager) trigger(hostname string) {
-	if sig, ok := m.sigs[hostname]; ok {
+func (m *InMemoryAuthorizationManager) trigger(fp string) {
+	if sig, ok := m.sigs[fp]; ok {
 		close(sig)
-		delete(m.sigs, hostname)
+		delete(m.sigs, fp)
 	}
 }
 func (m *InMemoryAuthorizationManager) GetStatus(cert *x509.Certificate) (qdef.ClientStatus, error) {
+	fp := qdef.FingerprintHex(cert)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.authorizeAll {
 		return qdef.StatusAuthorized, nil
 	}
-	status, ok := m.clients[cert.Subject.CommonName]
+	status, ok := m.clients[fp]
 	if !ok {
 		return qdef.StatusRevoked, nil
 	}
@@ -74,32 +77,45 @@ func (m *InMemoryAuthorizationManager) AuthorizeAll() {
 	}
 }
 func (m *InMemoryAuthorizationManager) SetStatus(id qdef.Identity, status qdef.ClientStatus) error {
+	if len(id.Fingerprint) == 0 {
+		return fmt.Errorf("missing fingerprint")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.clients[id.Hostname] = status
-	m.trigger(id.Hostname)
+	m.clients[id.Fingerprint] = status
+	m.trigger(id.Fingerprint)
 	return nil
 }
 func (m *InMemoryAuthorizationManager) IssueClientCertificate(id *qdef.Identity) ([]byte, []byte, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.clients[id.Hostname] = qdef.StatusUnauthorized
-	m.trigger(id.Hostname)
 	certPEM, keyPEM, err := m.CA.IssueClientCertificate(*id)
-	if err == nil {
-		// Update fingerprint in the identity.
-		leaf, _ := x509.ParseCertificate(certPEM)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Update fingerprint in the identity.
+	block, _ := pem.Decode(certPEM)
+	if block != nil {
+		leaf, _ := x509.ParseCertificate(block.Bytes)
 		if leaf != nil {
-			id.Fingerprint = fmt.Sprintf("%x", qdef.Fingerprint(leaf.Raw))
+			id.Fingerprint = qdef.FingerprintHex(leaf)
 		}
 	}
-	return certPEM, keyPEM, err
-}
-func (m *InMemoryAuthorizationManager) Revoke(id qdef.Identity) error {
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.clients[id.Hostname] = qdef.StatusRevoked
-	m.trigger(id.Hostname)
+	m.clients[id.Fingerprint] = qdef.StatusUnauthorized
+	m.trigger(id.Fingerprint)
+
+	return certPEM, keyPEM, nil
+}
+func (m *InMemoryAuthorizationManager) Revoke(id qdef.Identity) error {
+	if len(id.Fingerprint) == 0 {
+		return errors.New("fingerprint is empty")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.clients[id.Fingerprint] = qdef.StatusRevoked
+	m.trigger(id.Fingerprint)
 	return nil
 }
 func (m *InMemoryAuthorizationManager) AuthorizeRoles(fingerprint string, hostname string, requested []string) []string {
@@ -202,6 +218,15 @@ func (s *InMemoryCredentialStore) GetRootCAs() (*x509.CertPool, error) {
 func (s *InMemoryCredentialStore) SaveCredentials(id qdef.Identity, certPEM, keyPEM []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	block, _ := pem.Decode(certPEM)
+	if block != nil {
+		leaf, _ := x509.ParseCertificate(block.Bytes)
+		if leaf != nil {
+			id.Fingerprint = qdef.FingerprintHex(leaf)
+		}
+	}
+
 	s.Identity, s.CertPEM, s.KeyPEM = id, certPEM, keyPEM
 	if s.sig != nil {
 		close(s.sig)
@@ -337,7 +362,7 @@ func (o *TestObserver) OnStateChange(id qdef.Identity, state qdef.ClientState) {
 	now := time.Now()
 	second := now.Second()
 	milli := now.Nanosecond() / 1e6
-	o.t.Logf("%d.%d: State change [%s/%s]: %s", second, milli, id.Hostname, id.Fingerprint, state)
+	o.t.Logf("%d.%d: State change [%s]: %s", second, milli, id, state)
 	o.States <- state
 }
 
@@ -351,7 +376,7 @@ func (o *TestObserver) Logf(id qdef.Identity, format string, v ...interface{}) {
 	now := time.Now()
 	second := now.Second()
 	milli := now.Nanosecond() / 1e6
-	o.t.Logf("%d.%d: Log [%s/%s]: %s", second, milli, id.Hostname, id.Fingerprint, msg)
+	o.t.Logf("%d.%d: Log [%s]: %s", second, milli, id, msg)
 	o.Logs <- msg
 }
 

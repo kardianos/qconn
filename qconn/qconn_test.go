@@ -113,7 +113,8 @@ func TestFullConnectionLifecycle(t *testing.T) {
 	select {
 	case <-clientHandler.Connects:
 		t.Log("Test: Client connected. Authorizing now...")
-		err = authManager.SetStatus(id, qdef.StatusAuthorized)
+		provisionedID, _ := credStore.GetIdentity()
+		err = authManager.SetStatus(provisionedID, qdef.StatusAuthorized)
 		assertNoError(t, err)
 	case <-time.After(2 * time.Second):
 		t.Fatal("client did not connect/provision in time")

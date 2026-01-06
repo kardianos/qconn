@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"net"
 	"time"
@@ -26,6 +27,14 @@ var (
 // Fingerprint returns the SHA-256 hash of the provided data.
 func Fingerprint(data []byte) [32]byte {
 	return sha256.Sum256(data)
+}
+
+// FingerprintHex returns the SHA-256 hash of the certificate's raw bytes as a hex string.
+func FingerprintHex(cert *x509.Certificate) string {
+	if cert == nil {
+		return ""
+	}
+	return fmt.Sprintf("%x", Fingerprint(cert.Raw))
 }
 
 // EncodeCertPEM converts an x509 certificate to PEM format.

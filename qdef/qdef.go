@@ -89,6 +89,13 @@ type Identity struct {
 	Devices     []string `json:"devices"`
 }
 
+func (id Identity) String() string {
+	if id.Fingerprint == "" && id.Hostname == "" && id.Address == "" {
+		return "unknown"
+	}
+	return fmt.Sprintf("%s (%s, %s)", id.Fingerprint, id.Hostname, id.Address)
+}
+
 // MessageID is a unique identifier for a message.
 type MessageID int64
 
@@ -175,9 +182,11 @@ type AuthorizationManager interface {
 	AuthorizeRoles(fingerprint string, hostname string, requested []string) []string
 
 	// IssueClientCertificate creates a new client certificate for initial provisioning.
+	// The call should update the fingerprint in identity.
 	IssueClientCertificate(id *Identity) (certPEM []byte, keyPEM []byte, err error)
 
 	// RenewClientCertificate creates a new client certificate for an existing identity.
+	// The call should update the fingerprint in identity.
 	RenewClientCertificate(id *Identity) (certPEM []byte, keyPEM []byte, err error)
 
 	// Revoke invalidates the identity, preventing future authorizations or renewals.

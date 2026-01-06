@@ -194,6 +194,16 @@ func (c *Client) runProvisioning(ctx context.Context) error {
 		return fmt.Errorf("failed to unmarshal provisioning payload: %w", err)
 	}
 
+	/*
+		block, _ := pem.Decode(payload.CertPEM)
+		if block != nil {
+			leaf, _ := x509.ParseCertificate(block.Bytes)
+			if leaf != nil {
+				id.Fingerprint = qdef.FingerprintHex(leaf)
+			}
+		}
+	*/
+
 	if err := c.opt.CredentialStore.SaveCredentials(id, payload.CertPEM, payload.KeyPEM); err != nil {
 		return fmt.Errorf("failed to save credentials: %w", err)
 	}
@@ -213,6 +223,17 @@ func (c *Client) runRenewal(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	/*
+		block, _ := pem.Decode(payload.CertPEM)
+		if block != nil {
+			leaf, _ := x509.ParseCertificate(block.Bytes)
+			if leaf != nil {
+				id.Fingerprint = qdef.FingerprintHex(leaf)
+			}
+		}
+	*/
+
 	return c.opt.CredentialStore.SaveCredentials(id, payload.CertPEM, payload.KeyPEM)
 }
 
@@ -353,7 +374,7 @@ func (c *Client) supervisor(ctx context.Context) {
 				leaf, err := x509.ParseCertificate(tlsConfig.Certificates[0].Certificate[0])
 				if err == nil {
 					c.identity.Hostname = leaf.Subject.CommonName
-					c.identity.Fingerprint = fmt.Sprintf("%x", qdef.Fingerprint(leaf.Raw))
+					c.identity.Fingerprint = qdef.FingerprintHex(leaf)
 				}
 			}
 			c.attemptConnect(ctx, tlsConfig)

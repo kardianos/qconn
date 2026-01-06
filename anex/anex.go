@@ -11,12 +11,6 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-type contextKey int
-
-const (
-	identityKey contextKey = iota
-)
-
 // RoleConfig defines what a role can do.
 type RoleConfig struct {
 	Provides []string // Job types this role provides.
@@ -61,6 +55,13 @@ func (h *Hub) SetStaticAuthorization(fingerprint string, roles []string) {
 	h.staticAuthorizations[fingerprint] = roles
 }
 
+func (h *Hub) getIdentity(fingerprint string) qdef.Identity {
+	if val, ok := h.hostStates.Load(fingerprint); ok {
+		return *val.(*qdef.Identity)
+	}
+	return qdef.Identity{Fingerprint: fingerprint}
+}
+
 // AuthorizeRoles filters requested roles based on static configuration.
 func (h *Hub) AuthorizeRoles(fingerprint string, hostname string, requested []string) []string {
 	h.mu.RLock()
@@ -68,6 +69,7 @@ func (h *Hub) AuthorizeRoles(fingerprint string, hostname string, requested []st
 
 	allowed, ok := h.staticAuthorizations[fingerprint]
 	if !ok {
+		// Fallback to hostname for backward compatibility or initial provisioning.
 		allowed, ok = h.staticAuthorizations[hostname]
 		if !ok {
 			return nil
@@ -151,7 +153,8 @@ func (h *Hub) OnStateChange(id qdef.Identity, state qdef.ClientState) {
 func (h *Hub) GetConnectionByMachine(fingerprint string) (*quic.Conn, error) {
 	val, ok := h.activeConns.Load(fingerprint)
 	if !ok {
-		return nil, fmt.Errorf("machine %s not connected", fingerprint)
+		id := h.getIdentity(fingerprint)
+		return nil, fmt.Errorf("machine %s not connected", id)
 	}
 	return val.(*quic.Conn), nil
 }
@@ -172,7 +175,7 @@ func (h *Hub) ListHostStates() []qdef.HostState {
 }
 
 // Route directs a message to the target and returns the response.
-func (h *Hub) Route(ctx context.Context, msg qdef.Message) (*qdef.Message, error) {
+func (h *Hub) Route(ctx context.Context, senderID qdef.Identity, msg qdef.Message) (*qdef.Message, error) {
 	deadline := time.Now().Add(h.defaultWait)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
@@ -182,9 +185,14 @@ func (h *Hub) Route(ctx context.Context, msg qdef.Message) (*qdef.Message, error
 		conn, err := h.findTarget(msg.Target)
 		if err == nil {
 			// Check if sender has permission to send this job type.
-			senderRoles, ok := h.getSenderRoles(ctx)
-			if ok && !h.canSend(senderRoles, msg.Target.Type) {
-				return nil, fmt.Errorf("role %v not authorized to send job type %q", senderRoles, msg.Target.Type)
+			if senderID.Fingerprint == "" {
+				return nil, fmt.Errorf("sender fingerprint required")
+			}
+			if senderID.Fingerprint != msg.Target.Machine {
+				senderRoles := senderID.Roles
+				if !h.canSend(senderRoles, msg.Target.Type) {
+					return nil, fmt.Errorf("role %v not authorized to send job type %q", senderRoles, msg.Target.Type)
+				}
 			}
 
 			// Check if receiver has permission to provide this job type.
@@ -231,7 +239,7 @@ func (h *Hub) forward(ctx context.Context, conn *quic.Conn, msg qdef.Message) (*
 }
 
 // Request is a high-level helper that handles ID generation and CBOR abstraction.
-func (h *Hub) Request(ctx context.Context, target qdef.Addr, payload interface{}, response interface{}) error {
+func (h *Hub) Request(ctx context.Context, senderID qdef.Identity, target qdef.Addr, payload interface{}, response interface{}) error {
 	rawPayload, err := cbor.Marshal(payload)
 	if err != nil {
 		return err
@@ -243,7 +251,7 @@ func (h *Hub) Request(ctx context.Context, target qdef.Addr, payload interface{}
 		Payload: rawPayload,
 	}
 
-	respMsg, err := h.Route(ctx, msg)
+	respMsg, err := h.Route(ctx, senderID, msg)
 	if err != nil {
 		return err
 	}
@@ -260,10 +268,8 @@ func (h *Hub) Request(ctx context.Context, target qdef.Addr, payload interface{}
 
 // Handle implements qdef.StreamHandler.
 func (h *Hub) Handle(ctx context.Context, id qdef.Identity, msg qdef.Message, stream qdef.Stream) {
-	ctx = context.WithValue(ctx, identityKey, id)
-
 	if msg.Target.Service == qdef.ServiceUser {
-		resp, err := h.Route(ctx, msg)
+		resp, err := h.Route(ctx, id, msg)
 		if err != nil {
 			errorMsg := qdef.Message{
 				ID:    msg.ID,
@@ -284,14 +290,6 @@ func (h *Hub) Handle(ctx context.Context, id qdef.Identity, msg qdef.Message, st
 		Error: fmt.Sprintf("no handler for %s:%s", msg.Target.Service, msg.Target.Type),
 	}
 	cbor.NewEncoder(stream).Encode(resp)
-}
-
-func (h *Hub) getSenderRoles(ctx context.Context) ([]string, bool) {
-	id, ok := ctx.Value(identityKey).(qdef.Identity)
-	if !ok {
-		return nil, false
-	}
-	return id.Roles, true
 }
 
 func (h *Hub) getReceiverRoles(fingerprint string) []string {

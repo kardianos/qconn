@@ -64,7 +64,7 @@ type ServerOpt struct {
 func NewServer(opt ServerOpt) *Server {
 	cert, err := opt.Auth.ServerCertificate()
 	if err != nil {
-		panic(fmt.Sprintf("qconn: failed to get server certificate: %v", err))
+		panic(fmt.Errorf("qconn: failed to get server certificate: %w", err))
 	}
 	if opt.Auth == nil {
 		panic("qconn: auth is required")
@@ -126,11 +126,12 @@ func NewServer(opt ServerOpt) *Server {
 			}
 
 			status, err := opt.Auth.GetStatus(leaf)
+			fp := qdef.FingerprintHex(leaf)
 			if err != nil {
-				return fmt.Errorf("qconn: failed to get auth status for %s: %w", leaf.Subject.CommonName, err)
+				return fmt.Errorf("qconn: failed to get auth status for %s [%s]: %w", leaf.Subject.CommonName, fp, err)
 			}
 			if status == qdef.StatusRevoked {
-				return fmt.Errorf("qconn: client %s is revoked or not found", leaf.Subject.CommonName)
+				return fmt.Errorf("qconn: client %s [%s] is revoked or not found", leaf.Subject.CommonName, fp)
 			}
 			return nil
 		},
@@ -239,7 +240,7 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn) error {
 	id := qdef.Identity{
 		Hostname:    leaf.Subject.CommonName,
 		Address:     remoteAddr,
-		Fingerprint: fmt.Sprintf("%x", qdef.Fingerprint(leaf.Raw)),
+		Fingerprint: qdef.FingerprintHex(leaf),
 		Roles:       qdef.ExtractRolesFromCert(leaf),
 	}
 
@@ -340,6 +341,9 @@ func (s *Server) handleRenewal(ctx context.Context, id qdef.Identity, _ *struct{
 }
 
 func (s *Server) handleProvisioning(ctx context.Context, id qdef.Identity, req *qdef.Identity) (*qdef.CredentialResponse, error) {
+	provId := qdef.Identity{Hostname: req.Hostname}
+	s.notifyState(provId, qdef.StateProvisioning)
+
 	// Filter roles based on what's allowed.
 	req.Roles = s.authManager.AuthorizeRoles(req.Fingerprint, req.Hostname, req.Roles)
 
@@ -347,6 +351,8 @@ func (s *Server) handleProvisioning(ctx context.Context, id qdef.Identity, req *
 	if err != nil {
 		return nil, err
 	}
+
+	s.notifyState(*req, qdef.StateProvisioned)
 
 	return &qdef.CredentialResponse{CertPEM: certPEM, KeyPEM: keyPEM}, nil
 }

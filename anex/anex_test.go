@@ -96,6 +96,7 @@ func TestAnexRouting(t *testing.T) {
 	if fingerprint == "" {
 		t.Fatal("provider client did not register devices in time")
 	}
+	clientID.Fingerprint = fingerprint
 
 	// 4. Test Routing.
 	target := qdef.Addr{
@@ -106,7 +107,7 @@ func TestAnexRouting(t *testing.T) {
 
 	// 5. Send message via Hub.Request (which simulated a requester)
 	var resp PrintResp
-	err = hub.Request(ctx, target, &PrintReq{Content: "hello printer"}, &resp)
+	err = hub.Request(ctx, clientID, target, &PrintReq{Content: "hello printer"}, &resp)
 	if err != nil {
 		t.Fatalf("Hub.Request failed: %v", err)
 	}

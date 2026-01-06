@@ -1,4 +1,4 @@
-package qc
+package qconn
 
 import (
 	"context"
@@ -9,7 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fxamacker/cbor/v2"
+	"github.com/kardianos/qconn/qdef"
+	"github.com/kardianos/qconn/qmock"
 	"github.com/quic-go/quic-go"
 )
 
@@ -52,12 +53,14 @@ func assertNotNil(t *testing.T, v interface{}) {
 
 // --- Test Setup ---
 
-func setupTestInfra(ctx context.Context, t *testing.T) (*InMemoryAuthorizationManager, *TestStreamHandler, *TestStreamHandler, *TestObserver, *TestObserver) {
-	authManager := NewInMemoryAuthorizationManager()
-	clientHandler := NewTestStreamHandler(t)
-	serverHandler := NewTestStreamHandler(t)
-	clientObs := NewTestObserver(ctx, t)
-	serverObs := NewTestObserver(ctx, t)
+func setupTestInfra(ctx context.Context, t *testing.T) (*qmock.InMemoryAuthorizationManager, *qmock.TestStreamHandler, *qmock.TestStreamHandler, *qmock.TestObserver, *qmock.TestObserver) {
+	authManager := qmock.NewInMemoryAuthorizationManager()
+	clientHandler := qmock.NewTestStreamHandler(t)
+	serverHandler := qmock.NewTestStreamHandler(t)
+	serverHandler.Auth = authManager
+
+	clientObs := qmock.NewTestObserver(ctx, t)
+	serverObs := qmock.NewTestObserver(ctx, t)
 
 	return authManager, clientHandler, serverHandler, clientObs, serverObs
 }
@@ -72,9 +75,6 @@ func TestFullConnectionLifecycle(t *testing.T) {
 	defer serverHandler.Close()
 
 	// 1. Setup Server with dynamic ports.
-	serverCert, err := authManager.IssueServerCertificate(Identity{Hostname: testServerHostname})
-	assertNoError(t, err)
-
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	assertNoError(t, err)
 
@@ -83,22 +83,21 @@ func TestFullConnectionLifecycle(t *testing.T) {
 	server := NewServer(ServerOpt{
 		ListenOn:        "",
 		ProvisionTokens: []string{testProvisionToken},
-		ServerCert:      serverCert,
-		CACert:          authManager.RootCert(),
 		Auth:            authManager,
 		Handler:         serverHandler,
 		Observer:        serverObs,
 	})
+	serverHandler.RegisterHandlers(&server.Router)
 
 	err = server.Serve(ctx, packetConn)
 	assertNoError(t, err)
 
 	// 2. Client connects with NO initial credentials.
 	// It should use the provision token to automatically provision itself.
-	id := Identity{Hostname: testClientHostname}
-	credStore := &InMemoryCredentialStore{rootCACert: authManager.RootCert(), identity: id, provisionToken: testProvisionToken}
+	id := qdef.Identity{Hostname: testClientHostname}
+	credStore := &qmock.InMemoryCredentialStore{RootCA: authManager.RootCert(), Identity: id, Token: testProvisionToken}
 
-	resolver := &MockResolver{}
+	resolver := &qmock.MockResolver{}
 	resolver.SetAddress(quicAddr)
 	client := NewClient(ClientOpt{
 		ServerHostname:  testServerHostname,
@@ -114,74 +113,31 @@ func TestFullConnectionLifecycle(t *testing.T) {
 	select {
 	case <-clientHandler.Connects:
 		t.Log("Test: Client connected. Authorizing now...")
-		err = authManager.SetStatus(id, StatusAuthorized)
+		err = authManager.SetStatus(id, qdef.StatusAuthorized)
 		assertNoError(t, err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("client did not connect/provision in time")
 	}
 
-	// 5. Open a stream and verify communication.
-	conn := client.Connection()
-	assertNotNil(t, conn)
+	// 5. Verify bidirectional communication using the high-level Request API.
+	t.Log("Test: Verifying bidirectional communication via Request.")
 
-	t.Log("Test: Client opening a new stream.")
-	stream, err := conn.OpenStreamSync(ctx)
-	assertNoError(t, err)
-	defer stream.Close()
-
-	// Send an empty message to force stream frame.
-	clientHandler.DataToSend <- ""
-
-	// --- THE FIX: Start a full, bidirectional handler for the client's stream ---
-	// Start a goroutine to read from the stream and populate the client's receive channel.
-	go func() {
-		dec := cbor.NewDecoder(stream)
-		t.Log("Client decoder started")
-		for {
-			t.Log("Client attempting to decode")
-			var msg string
-			if err := dec.Decode(&msg); err != nil {
-				t.Logf("Client decode error: %v", err)
-				return // Expected on stream close.
-			}
-			t.Logf("Client decoded msg: %s", msg)
-			clientHandler.ReceivedData <- msg
-		}
-	}()
-
-	// Start a goroutine to write to the stream from the client's send channel.
-	go func() {
-		enc := cbor.NewEncoder(stream)
-		for msg := range clientHandler.DataToSend {
-			if err := enc.Encode(msg); err != nil {
-				t.Logf("client test writer error: %v", err)
-				return
-			}
-		}
-	}()
-	// --- END FIX ---
-
-	t.Log("Test: Server sending 'hello from server'.")
+	// Prepare data for the server to send back when it handles our request.
 	serverHandler.DataToSend <- "hello from server"
-	select {
-	case msg := <-clientHandler.ReceivedData:
-		assertEqual(t, "hello from server", msg)
-		t.Log("Test: Client successfully received message from server.")
 
-		msg = <-serverHandler.ReceivedData
-		assertEqual(t, "", msg)
-		t.Log("Test: Server received initial empty message.")
-	case <-time.After(3 * time.Second):
-		t.Fatal("client did not receive message")
-	}
+	resp := ""
+	target := qdef.Addr{Service: qdef.ServiceUser} // Empty Type matches the test handler.
+	_, err = client.Request(ctx, target, "hello from client", &resp)
+	assertNoError(t, err)
 
-	t.Log("Test: Client sending 'hello from client'.")
-	clientHandler.DataToSend <- "hello from client"
+	assertEqual(t, "hello from server", resp)
+	t.Log("Test: Client successfully received 'hello from server' as response.")
+
 	select {
 	case msg := <-serverHandler.ReceivedData:
 		assertEqual(t, "hello from client", msg)
-		t.Log("Test: Server successfully received message from client.")
-	case <-time.After(3 * time.Second):
+		t.Log("Test: Server received 'hello from client'.")
+	default:
 		t.Fatal("server did not receive message")
 	}
 }
@@ -193,22 +149,22 @@ func TestConnectionMigration(t *testing.T) {
 	defer clientHandler.Close()
 
 	// 1. Setup common certs and TLS configs.
-	serverCert, err := authManager.IssueServerCertificate(Identity{Hostname: testServerHostname})
-	assertNoError(t, err)
-	id := Identity{Hostname: testClientHostname}
+	id := qdef.Identity{Hostname: testClientHostname}
 	clientCertPEM, clientKeyPEM, err := authManager.IssueClientCertificate(&id)
 	assertNoError(t, err)
 
 	caPool := x509.NewCertPool()
 	caPool.AddCert(authManager.RootCert())
+	serverCert, err := authManager.ServerCertificate()
+	assertNoError(t, err)
 	serverTlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{serverCert},
 		ClientCAs:    caPool,
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 	}
 
-	credStore := &InMemoryCredentialStore{rootCACert: authManager.RootCert(), identity: Identity{Hostname: testClientHostname}, provisionToken: testProvisionToken}
-	err = credStore.SaveCredentials(Identity{Hostname: testClientHostname}, clientCertPEM, clientKeyPEM)
+	credStore := &qmock.InMemoryCredentialStore{RootCA: authManager.RootCert(), Identity: qdef.Identity{Hostname: testClientHostname}, Token: testProvisionToken}
+	err = credStore.SaveCredentials(qdef.Identity{Hostname: testClientHostname}, clientCertPEM, clientKeyPEM)
 	assertNoError(t, err)
 
 	// 2. Start a minimal Server A.
@@ -224,7 +180,7 @@ func TestConnectionMigration(t *testing.T) {
 	}()
 
 	// 3. Connect client to Server A.
-	resolver := &MockResolver{}
+	resolver := &qmock.MockResolver{}
 	resolver.SetAddress(addrA)
 
 	client := NewClient(ClientOpt{
@@ -296,18 +252,15 @@ func TestSupervisorDNSUpdate(t *testing.T) {
 	authManager, clientHandler, _, clientObs, _ := setupTestInfra(ctx, t)
 	defer clientHandler.Close()
 
-	serverCert, err := authManager.IssueServerCertificate(Identity{Hostname: testServerHostname})
-	assertNoError(t, err)
-
-	id := Identity{Hostname: testClientHostname}
+	id := qdef.Identity{Hostname: testClientHostname}
 	clientCertPEM, clientKeyPEM, err := authManager.IssueClientCertificate(&id)
 	assertNoError(t, err)
 
-	credStore := &InMemoryCredentialStore{rootCACert: authManager.RootCert(), provisionToken: testProvisionToken}
-	err = credStore.SaveCredentials(Identity{Hostname: testClientHostname}, clientCertPEM, clientKeyPEM)
+	credStore := &qmock.InMemoryCredentialStore{RootCA: authManager.RootCert(), Token: testProvisionToken}
+	err = credStore.SaveCredentials(qdef.Identity{Hostname: testClientHostname}, clientCertPEM, clientKeyPEM)
 	assertNoError(t, err)
 
-	resolver := &MockResolver{}
+	resolver := &qmock.MockResolver{}
 	resolver.SetAddress("127.0.0.1:12345") // Dummy initial address.
 
 	client := NewClient(ClientOpt{
@@ -316,7 +269,8 @@ func TestSupervisorDNSUpdate(t *testing.T) {
 		Resolver:        resolver,
 		Handler:         clientHandler,
 		Observer:        clientObs,
-		ResolverRefresh: 500 * time.Millisecond,
+		ResolverRefresh: 50 * time.Millisecond,
+		DialTimeout:     100 * time.Millisecond,
 	})
 
 	// 1. Initial connect attempt (will fail, but supervisor will start).
@@ -327,6 +281,10 @@ func TestSupervisorDNSUpdate(t *testing.T) {
 	// 2. Setup actual server.
 	caPool := x509.NewCertPool()
 	caPool.AddCert(authManager.RootCert())
+
+	serverCert, err := authManager.ServerCertificate()
+	assertNoError(t, err)
+
 	serverTlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{serverCert},
 		ClientCAs:    caPool,
@@ -362,22 +320,19 @@ func TestServerDowntimeRecovery(t *testing.T) {
 	authManager, clientHandler, serverHandler, clientObs, serverObs := setupTestInfra(ctx, t)
 	defer clientHandler.Close()
 	defer serverHandler.Close()
-
-	serverCert, err := authManager.IssueServerCertificate(Identity{Hostname: testServerHostname})
-	assertNoError(t, err)
-	id := Identity{Hostname: testClientHostname}
+	id := qdef.Identity{Hostname: testClientHostname}
 	clientCertPEM, clientKeyPEM, err := authManager.IssueClientCertificate(&id)
 	assertNoError(t, err)
 
-	credStore := &InMemoryCredentialStore{rootCACert: authManager.RootCert(), provisionToken: testProvisionToken}
-	err = credStore.SaveCredentials(Identity{Hostname: testClientHostname}, clientCertPEM, clientKeyPEM)
+	credStore := &qmock.InMemoryCredentialStore{RootCA: authManager.RootCert(), Token: testProvisionToken}
+	err = credStore.SaveCredentials(qdef.Identity{Hostname: testClientHostname}, clientCertPEM, clientKeyPEM)
 	assertNoError(t, err)
 
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	assertNoError(t, err)
 	addr := packetConn.LocalAddr().String()
 
-	resolver := &MockResolver{}
+	resolver := &qmock.MockResolver{}
 	resolver.SetAddress(addr)
 
 	client := NewClient(ClientOpt{
@@ -391,14 +346,12 @@ func TestServerDowntimeRecovery(t *testing.T) {
 
 	// 1. Start Server.
 	server := NewServer(ServerOpt{
-		ServerCert:      serverCert,
-		CACert:          authManager.RootCert(),
 		Auth:            authManager,
 		Handler:         serverHandler,
 		Observer:        serverObs,
 		KeepAlivePeriod: 500 * time.Millisecond,
 	})
-	authManager.SetStatus(id, StatusAuthorized)
+	authManager.SetStatus(id, qdef.StatusAuthorized)
 
 	err = server.Serve(ctx, packetConn)
 	assertNoError(t, err)
@@ -420,7 +373,7 @@ func TestServerDowntimeRecovery(t *testing.T) {
 	packetConn.Close()
 
 	// Wait for client to detect loss.
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 
 	// 4. RESTART Server on same port.
 	t.Log("Restarting server on same port...")
@@ -446,17 +399,17 @@ func TestContinuousRetries(t *testing.T) {
 	authManager, clientHandler, _, clientObs, _ := setupTestInfra(ctx, t)
 	defer clientHandler.Close()
 
-	id := Identity{Hostname: testClientHostname}
+	id := qdef.Identity{Hostname: testClientHostname}
 
 	clientCertPEM, clientKeyPEM, err := authManager.IssueClientCertificate(&id)
 	assertNoError(t, err)
 
-	credStore := &InMemoryCredentialStore{rootCACert: authManager.RootCert(), provisionToken: testProvisionToken}
+	credStore := &qmock.InMemoryCredentialStore{RootCA: authManager.RootCert(), Token: testProvisionToken}
 	err = credStore.SaveCredentials(id, clientCertPEM, clientKeyPEM)
 	assertNoError(t, err)
 
 	// Point to a dead address initially.
-	resolver := &MockResolver{}
+	resolver := &qmock.MockResolver{}
 	resolver.SetAddress("127.0.0.1:54321")
 
 	client := NewClient(ClientOpt{
@@ -465,6 +418,7 @@ func TestContinuousRetries(t *testing.T) {
 		Resolver:        resolver,
 		Handler:         clientHandler,
 		Observer:        clientObs,
+		DialTimeout:     100 * time.Millisecond,
 	})
 
 	err = client.Connect(ctx)
@@ -472,13 +426,13 @@ func TestContinuousRetries(t *testing.T) {
 	defer client.Close()
 
 	// Wait for a few failed attempts (should be visible in logs if we could see them).
-	time.Sleep(2 * time.Second)
+	time.Sleep(250 * time.Millisecond)
 
 	// Now bring up a server on a NEW address and update resolver.
-	serverCert, err := authManager.IssueServerCertificate(Identity{Hostname: testServerHostname})
-	assertNoError(t, err)
 	caPool := x509.NewCertPool()
 	caPool.AddCert(authManager.RootCert())
+	serverCert, err := authManager.ServerCertificate()
+	assertNoError(t, err)
 	serverTlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{serverCert},
 		ClientCAs:    caPool,
@@ -502,22 +456,23 @@ func TestContinuousRetries(t *testing.T) {
 
 func TestProvisioningRetry(t *testing.T) {
 	// 1. Setup Mock Resolver.
-	mockRes := &MockResolver{}
+	mockRes := &qmock.MockResolver{}
 	addr := "127.0.0.1:54322"
 	mockRes.SetAddress(addr)
 
 	// 2. Setup authManager (which is also the CA).
-	auth := NewInMemoryAuthorizationManager()
+	auth := qmock.NewInMemoryAuthorizationManager()
 
 	// 3. Setup client with a ProvisionToken but NO credentials.
-	store := &InMemoryCredentialStore{
-		rootCACert:     auth.RootCert(),
-		provisionToken: testProvisionToken,
+	store := &qmock.InMemoryCredentialStore{
+		RootCA: auth.RootCert(),
+		Token:  testProvisionToken,
 	}
 	client := NewClient(ClientOpt{
-		ServerHostname:  "test-server",
+		ServerHostname:  testServerHostname,
 		CredentialStore: store,
 		Resolver:        mockRes,
+		DialTimeout:     100 * time.Millisecond,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -528,21 +483,17 @@ func TestProvisioningRetry(t *testing.T) {
 	}
 
 	// 4. Client should be in provisioning loop, failing to dial the non-existent server.
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	// 5. Start the provisioning server now.
-	// 5. Start the provisioning server now.
-	serverCert, err := auth.IssueServerCertificate(Identity{Hostname: "test-server"})
-	if err != nil {
-		t.Fatalf("failed to issue server cert: %v", err)
-	}
 
+	serverHandler := qmock.NewTestStreamHandler(t)
+	serverHandler.Auth = auth
 	server := NewServer(ServerOpt{
-		ServerCert:      serverCert,
-		CACert:          auth.RootCert(),
 		Auth:            auth,
 		ProvisionTokens: []string{testProvisionToken},
-		Observer:        NewTestObserver(ctx, t),
+		Handler:         serverHandler,
+		Observer:        qmock.NewTestObserver(ctx, t),
 	})
 
 	packetConn, err := net.ListenPacket("udp", addr)
@@ -583,29 +534,25 @@ func TestClientObserver(t *testing.T) {
 	authManager, clientHandler, _, obs, serverObs := setupTestInfra(ctx, t)
 	defer clientHandler.Close()
 
-	id := Identity{Hostname: testServerHostname}
-
-	serverCert, err := authManager.IssueServerCertificate(id)
-	assertNoError(t, err)
-
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	assertNoError(t, err)
 	defer packetConn.Close()
 	quicAddr := packetConn.LocalAddr().String()
 
+	serverHandler := qmock.NewTestStreamHandler(t)
+	serverHandler.Auth = authManager
 	server := NewServer(ServerOpt{
 		ProvisionTokens: []string{testProvisionToken},
-		ServerCert:      serverCert,
-		CACert:          authManager.RootCert(),
 		Auth:            authManager,
+		Handler:         serverHandler,
 		Observer:        serverObs,
 	})
 
 	err = server.Serve(ctx, packetConn)
 	assertNoError(t, err)
 
-	credStore := &InMemoryCredentialStore{rootCACert: authManager.RootCert(), identity: Identity{Hostname: testClientHostname}, provisionToken: testProvisionToken}
-	resolver := &MockResolver{}
+	credStore := &qmock.InMemoryCredentialStore{RootCA: authManager.RootCert(), Identity: qdef.Identity{Hostname: testClientHostname}, Token: testProvisionToken}
+	resolver := &qmock.MockResolver{}
 	resolver.SetAddress(quicAddr)
 
 	client := NewClient(ClientOpt{
@@ -621,7 +568,7 @@ func TestClientObserver(t *testing.T) {
 	defer client.Close()
 
 	// Verify states
-	expectedStates := []ClientState{StateProvisioning, StateProvisioned, StateConnecting, StateConnected}
+	expectedStates := []qdef.ClientState{qdef.StateProvisioning, qdef.StateProvisioned, qdef.StateConnecting, qdef.StateConnected}
 	for _, expected := range expectedStates {
 		select {
 		case state := <-obs.States:
@@ -645,56 +592,55 @@ func TestClientObserver(t *testing.T) {
 }
 
 func TestConnectionReliability(t *testing.T) {
-	auth := NewInMemoryAuthorizationManager()
-	serverCert, err := auth.IssueServerCertificate(Identity{Hostname: testServerHostname})
-	assertNoError(t, err)
-
-	id := Identity{Hostname: testClientHostname}
+	auth := qmock.NewInMemoryAuthorizationManager()
+	id := qdef.Identity{Hostname: testClientHostname}
 	clientCertPEM, clientKeyPEM, err := auth.IssueClientCertificate(&id)
 	assertNoError(t, err)
 
-	credStore := &InMemoryCredentialStore{rootCACert: auth.RootCert()}
-	err = credStore.SaveCredentials(Identity{Hostname: testClientHostname}, clientCertPEM, clientKeyPEM)
+	credStore := &qmock.InMemoryCredentialStore{Identity: id, Token: "test-token", RootCA: auth.RootCert()}
+	err = credStore.SaveCredentials(qdef.Identity{Hostname: testClientHostname}, clientCertPEM, clientKeyPEM)
 	assertNoError(t, err)
 
 	// Short timeout for fast testing.
 
-	setup := func(t *testing.T) (context.Context, context.CancelFunc, *Client, *InterceptingPacketConn, *TestObserver) {
+	setup := func(t *testing.T) (context.Context, context.CancelFunc, *Client, *qmock.InterceptingPacketConn, *qmock.TestObserver) {
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-		sObs := NewTestObserver(ctx, t)
+		sObs := qmock.NewTestObserver(ctx, t)
+		serverHandler := qmock.NewTestStreamHandler(t)
+		serverHandler.Auth = auth
 		server := NewServer(ServerOpt{
-			ServerCert:      serverCert,
-			CACert:          auth.RootCert(),
 			Auth:            auth,
-			KeepAlivePeriod: 500 * time.Millisecond,
+			KeepAlivePeriod: 100 * time.Millisecond,
 			Observer:        sObs,
+			Handler:         serverHandler,
 		})
-		auth.SetStatus(id, StatusAuthorized)
+		auth.SetStatus(id, qdef.StatusAuthorized)
 
 		sConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 		assertNoError(t, err)
-		serverIConn := NewInterceptingPacketConn(sConn)
+		serverIConn := qmock.NewInterceptingPacketConn(sConn)
 		err = server.Serve(ctx, serverIConn)
 		assertNoError(t, err)
 
-		resolver := &MockResolver{}
+		resolver := &qmock.MockResolver{}
 		resolver.SetAddress(sConn.LocalAddr().String())
 
-		obs := NewTestObserver(ctx, t)
+		obs := qmock.NewTestObserver(ctx, t)
 		client := NewClient(ClientOpt{
 			ServerHostname:  testServerHostname,
 			CredentialStore: credStore,
 			Resolver:        resolver,
 			Observer:        obs,
-			KeepAlivePeriod: 500 * time.Millisecond,
+			KeepAlivePeriod: 100 * time.Millisecond,
+			DialTimeout:     200 * time.Millisecond,
 		})
 
 		return ctx, cancel, client, serverIConn, obs
 	}
 
-	const timeout = 5 * time.Second
+	const timeout = 1 * time.Second
 
-	waitForState := func(t *testing.T, obs *TestObserver, expected ClientState, timeout time.Duration) {
+	waitForState := func(t *testing.T, obs *qmock.TestObserver, expected qdef.ClientState, timeout time.Duration) {
 		deadline := time.Now().Add(timeout)
 		for time.Now().Before(deadline) {
 			select {
@@ -715,14 +661,14 @@ func TestConnectionReliability(t *testing.T) {
 		err := client.Connect(ctx)
 		assertNoError(t, err)
 
-		waitForState(t, obs, StateConnected, timeout)
+		waitForState(t, obs, qdef.StateConnected, timeout)
 
 		// Now block EVERYTHING on the server side.
 		sIConn.BlockReads(true)
 		sIConn.BlockWrites(true)
 
 		// Client should sense the timeout and move to disconnected (then connecting).
-		waitForState(t, obs, StateDisconnected, timeout)
+		waitForState(t, obs, qdef.StateDisconnected, timeout)
 	})
 
 	t.Run("Unidirectional_StoC_Block", func(t *testing.T) {
@@ -732,12 +678,12 @@ func TestConnectionReliability(t *testing.T) {
 		err := client.Connect(ctx)
 		assertNoError(t, err)
 
-		waitForState(t, obs, StateConnected, timeout)
+		waitForState(t, obs, qdef.StateConnected, timeout)
 
 		sIConn.BlockWrites(true)
 
 		// Client should timeout because it's not receiving anything from the server.
-		waitForState(t, obs, StateDisconnected, timeout)
+		waitForState(t, obs, qdef.StateDisconnected, timeout)
 	})
 
 	t.Run("Unidirectional_CtoS_Block", func(t *testing.T) {
@@ -747,13 +693,13 @@ func TestConnectionReliability(t *testing.T) {
 		err := client.Connect(ctx)
 		assertNoError(t, err)
 
-		waitForState(t, obs, StateConnected, timeout)
+		waitForState(t, obs, qdef.StateConnected, timeout)
 
 		sIConn.BlockReads(true)
 
 		// Server won't receive heartbeats/ACKs from client.
 		// Client might also sense failure if it doesn't get ACKs for its heartbeats.
 		// In QUIC, heartbeats expect ACKs. If the client doesn't get ACKs, it will timeout.
-		waitForState(t, obs, StateDisconnected, timeout)
+		waitForState(t, obs, qdef.StateDisconnected, timeout)
 	})
 }

@@ -1,4 +1,4 @@
-package qc
+package qdef
 
 import (
 	"crypto/ecdsa"
@@ -11,6 +11,7 @@ import (
 	"encoding/asn1"
 	"encoding/pem"
 	"math/big"
+	"net"
 	"time"
 )
 
@@ -22,6 +23,11 @@ var (
 // Fingerprint returns the SHA-256 hash of the provided data.
 func Fingerprint(data []byte) [32]byte {
 	return sha256.Sum256(data)
+}
+
+// EncodeCertPEM converts an x509 certificate to PEM format.
+func EncodeCertPEM(cert *x509.Certificate) []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
 }
 
 // CreateCA creates a new self-signed Certificate Authority.
@@ -63,9 +69,12 @@ func CreateCert(caCert *x509.Certificate, caKey *ecdsa.PrivateKey, hostname stri
 		Subject:      pkix.Name{CommonName: hostname},
 		DNSNames:     []string{hostname}, // Use SAN for modern validation.
 		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
+		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	if ip := net.ParseIP(hostname); ip != nil {
+		template.IPAddresses = append(template.IPAddresses, ip)
 	}
 	if isServer {
 		template.ExtKeyUsage = append(template.ExtKeyUsage, x509.ExtKeyUsageServerAuth)

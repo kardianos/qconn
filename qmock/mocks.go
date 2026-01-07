@@ -338,46 +338,63 @@ func (h *TestStreamHandler) Close() { close(h.DataToSend) }
 
 // TestObserver is a test implementation of ClientObserver.
 type TestObserver struct {
-	ctx    context.Context
 	t      *testing.T
 	States chan qdef.ClientState
 	Logs   chan string
+	mu     sync.Mutex
+	done   bool
 }
 
 func NewTestObserver(ctx context.Context, t *testing.T) *TestObserver {
-	return &TestObserver{
-		ctx:    ctx,
+	o := &TestObserver{
 		t:      t,
 		States: make(chan qdef.ClientState, 100),
 		Logs:   make(chan string, 100),
 	}
+	// Use t.Cleanup to set done synchronously when test ends.
+	t.Cleanup(func() {
+		o.mu.Lock()
+		o.done = true
+		o.mu.Unlock()
+	})
+	return o
 }
 
 func (o *TestObserver) OnStateChange(id qdef.Identity, state qdef.ClientState) {
-	select {
-	case <-o.ctx.Done():
+	o.mu.Lock()
+	if o.done {
+		o.mu.Unlock()
 		return
-	default:
 	}
 	now := time.Now()
 	second := now.Second()
 	milli := now.Nanosecond() / 1e6
 	o.t.Logf("%d.%d: State change [%s]: %s", second, milli, id, state)
-	o.States <- state
+	o.mu.Unlock()
+
+	select {
+	case o.States <- state:
+	default:
+	}
 }
 
 func (o *TestObserver) Logf(id qdef.Identity, format string, v ...interface{}) {
-	select {
-	case <-o.ctx.Done():
+	o.mu.Lock()
+	if o.done {
+		o.mu.Unlock()
 		return
-	default:
 	}
 	msg := fmt.Sprintf(format, v...)
 	now := time.Now()
 	second := now.Second()
 	milli := now.Nanosecond() / 1e6
 	o.t.Logf("%d.%d: Log [%s]: %s", second, milli, id, msg)
-	o.Logs <- msg
+	o.mu.Unlock()
+
+	select {
+	case o.Logs <- msg:
+	default:
+	}
 }
 
 // InterceptingPacketConn wraps a net.PacketConn and allows blocking reads/writes.

@@ -144,19 +144,20 @@ func Request[Req, Resp any](c *Client, ctx context.Context, target qdef.Addr, re
 	return &resp, nil
 }
 
-// ListDevices returns the current state of the entire network.
-func (c *Client) ListDevices(ctx context.Context) ([]qdef.HostState, error) {
+// ListMachines returns the current state of the entire network.
+func (c *Client) ListMachines(ctx context.Context, includeUnprovisioned bool) ([]qdef.HostState, error) {
 	target := qdef.Addr{
 		Service: qdef.ServiceSystem,
-		Type:    "list-hosts",
+		Type:    "list-machines",
 	}
 
-	var hosts []qdef.HostState
-	_, err := c.qcClient.Request(ctx, target, nil, &hosts)
+	req := qdef.ListMachinesReq{ShowUnprovisioned: includeUnprovisioned}
+	var resp qdef.ListMachinesResp
+	_, err := c.qcClient.Request(ctx, target, &req, &resp)
 	if err != nil {
 		return nil, err
 	}
-	return hosts, nil
+	return resp.Hosts, nil
 }
 
 func (c *Client) RegisterHandlers(r *qdef.StreamRouter) {

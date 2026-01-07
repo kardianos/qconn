@@ -80,7 +80,7 @@ func TestAnexRouting(t *testing.T) {
 	fingerprint := ""
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		states := hub.ListHostStates()
+		states := hub.ListHostStates(false)
 		for _, s := range states {
 			if s.Identity.Hostname == "provider-01" && s.Online && len(s.Identity.Devices) > 0 {
 				fingerprint = s.Identity.Fingerprint
@@ -113,6 +113,59 @@ func TestAnexRouting(t *testing.T) {
 	}
 	if !resp.OK {
 		t.Fatalf("expected OK=true")
+	}
+}
+
+func TestProvisionedUnprovisioned(t *testing.T) {
+	ctx := context.Background()
+	id := qdef.Identity{}
+
+	hub := NewHub(0)
+
+	// Add unprovisioned
+	hub.unprovisioned.Store("machine-alpha", struct{}{})
+	hub.unprovisioned.Store("machine-beta", struct{}{})
+
+	// List with unprovisioned
+	resp, err := hub.handleListMachines(ctx, id, &qdef.ListMachinesReq{ShowUnprovisioned: true})
+	if err != nil {
+		t.Fatalf("list machines: %v", err)
+	}
+	if len(resp.Hosts) != 2 {
+		t.Errorf("expected 2 unprovisioned hosts, got %d", len(resp.Hosts))
+	}
+	for _, h := range resp.Hosts {
+		if h.Provisioned {
+			t.Errorf("expected unprovisioned host, got provisioned: %v", h)
+		}
+	}
+
+	// Provision one
+	provReq := &qdef.ProvisionReq{Fingerprint: []string{"machine-alpha"}}
+	_, err = hub.handleProvision(ctx, id, provReq)
+	if err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+
+	// Check lists - without unprovisioned flag should show nothing (no connected hosts)
+	resp2, err := hub.handleListMachines(ctx, id, &qdef.ListMachinesReq{ShowUnprovisioned: false})
+	if err != nil {
+		t.Fatalf("list machines: %v", err)
+	}
+	if len(resp2.Hosts) != 0 {
+		t.Errorf("expected 0 provisioned hosts (none connected), got %d", len(resp2.Hosts))
+	}
+
+	// With unprovisioned flag should show only machine-beta now
+	resp3, err := hub.handleListMachines(ctx, id, &qdef.ListMachinesReq{ShowUnprovisioned: true})
+	if err != nil {
+		t.Fatalf("list machines: %v", err)
+	}
+	if len(resp3.Hosts) != 1 {
+		t.Errorf("expected 1 unprovisioned host, got %d", len(resp3.Hosts))
+	}
+	if resp3.Hosts[0].Identity.Hostname != "machine-beta" {
+		t.Errorf("expected machine-beta got %v", resp3.Hosts[0].Identity.Hostname)
 	}
 }
 

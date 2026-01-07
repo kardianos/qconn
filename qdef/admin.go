@@ -12,9 +12,5 @@ type ListMachinesResp struct {
 
 // ProvisionReq parameters for provision-machine RPC.
 type ProvisionReq struct {
-	Hostname    string   `cbor:"hostname"`
-	Address     string   `cbor:"address"`
-	Provisioned bool     `cbor:"provisioned"`
-	Roles       []string `cbor:"roles,omitempty"`
-	Devices     []string `cbor:"devices,omitempty"`
+	Fingerprint []string `cbor:"fingerprint"`
 }

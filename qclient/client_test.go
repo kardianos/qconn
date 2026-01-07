@@ -106,7 +106,7 @@ func TestSimpleClientAPI(t *testing.T) {
 	// 4. Test Discovery & Request
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		hosts, err := reqClient.ListDevices(ctx)
+		hosts, err := reqClient.ListMachines(ctx, false)
 		if err == nil {
 			for _, h := range hosts {
 				for _, d := range h.Identity.Devices {
@@ -188,7 +188,7 @@ func TestDeviceProviders(t *testing.T) {
 	// 3. Verify initial devices
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		hosts, _ := client.ListDevices(ctx)
+		hosts, _ := client.ListMachines(ctx, false)
 		for _, h := range hosts {
 			if h.Online {
 				devs := h.Identity.Devices
@@ -221,7 +221,7 @@ step4:
 
 	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		hosts, _ := client.ListDevices(ctx)
+		hosts, _ := client.ListMachines(ctx, false)
 		for _, h := range hosts {
 			if h.Online {
 				found := false

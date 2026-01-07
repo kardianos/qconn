@@ -26,6 +26,7 @@ type Hub struct {
 
 	roleDefs             map[string]RoleConfig
 	staticAuthorizations map[string][]string // fingerprint -> allowed roles
+	unprovisioned        sync.Map            // hostname -> struct{}
 }
 
 func NewHub(defaultWait time.Duration) *Hub {
@@ -124,7 +125,8 @@ func (h *Hub) canProvide(receiverRoles []string, jobType string) bool {
 
 func (h *Hub) RegisterHandlers(r *qdef.StreamRouter) {
 	qdef.Handle(r, qdef.ServiceSystem, "devices", h.handleDeviceUpdate)
-	qdef.Handle(r, qdef.ServiceSystem, "list-hosts", h.handleListHosts)
+	qdef.Handle(r, qdef.ServiceSystem, "list-machines", h.handleListMachines)
+	qdef.Handle(r, qdef.ServiceSystem, "provision", h.handleProvision)
 }
 
 // OnIdentityConnect implements qconn.StateListener.
@@ -160,17 +162,34 @@ func (h *Hub) GetConnectionByMachine(fingerprint string) (*quic.Conn, error) {
 }
 
 // ListHostStates returns the current state of all known hosts.
-func (h *Hub) ListHostStates() []qdef.HostState {
+func (h *Hub) ListHostStates(includeUnprovisioned bool) []qdef.HostState {
 	var states []qdef.HostState
+
+	// Add provisioned hosts.
 	h.hostStates.Range(func(key, value interface{}) bool {
 		id := value.(*qdef.Identity)
 		_, online := h.activeConns.Load(id.Fingerprint)
 		states = append(states, qdef.HostState{
-			Identity: *id,
-			Online:   online,
+			Identity:    *id,
+			Online:      online,
+			Provisioned: true,
 		})
 		return true
 	})
+
+	// Add unprovisioned hosts if requested.
+	if includeUnprovisioned {
+		h.unprovisioned.Range(func(key, value any) bool {
+			hostname := key.(string)
+			states = append(states, qdef.HostState{
+				Identity:    qdef.Identity{Hostname: hostname},
+				Online:      false,
+				Provisioned: false,
+			})
+			return true
+		})
+	}
+
 	return states
 }
 
@@ -308,7 +327,17 @@ func (h *Hub) handleDeviceUpdate(ctx context.Context, id qdef.Identity, req *qde
 	return &struct{}{}, nil
 }
 
-func (h *Hub) handleListHosts(ctx context.Context, id qdef.Identity, _ *struct{}) (*[]qdef.HostState, error) {
-	hosts := h.ListHostStates()
-	return &hosts, nil
+func (h *Hub) handleListMachines(ctx context.Context, id qdef.Identity, req *qdef.ListMachinesReq) (*qdef.ListMachinesResp, error) {
+	hosts := h.ListHostStates(req.ShowUnprovisioned)
+	return &qdef.ListMachinesResp{Hosts: hosts}, nil
+}
+
+func (h *Hub) handleProvision(ctx context.Context, id qdef.Identity, req *qdef.ProvisionReq) (*struct{}, error) {
+	for _, fp := range req.Fingerprint {
+		h.unprovisioned.Delete(fp)
+		h.mu.Lock()
+		h.staticAuthorizations[fp] = nil
+		h.mu.Unlock()
+	}
+	return &struct{}{}, nil
 }

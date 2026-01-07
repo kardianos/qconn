@@ -93,7 +93,7 @@ func TestRoleBasedRouting(t *testing.T) {
 	var managerFingerprint string
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		states := hub.ListHostStates()
+		states := hub.ListHostStates(false)
 		for _, s := range states {
 			if s.Identity.Hostname == "worker-01" && s.Online && len(s.Identity.Devices) > 0 {
 				workerFingerprint = s.Identity.Fingerprint

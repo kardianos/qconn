@@ -140,8 +140,9 @@ type Message struct {
 
 // HostState represents the known state of a host.
 type HostState struct {
-	Identity Identity
-	Online   bool
+	Identity    Identity
+	Online      bool
+	Provisioned bool
 }
 
 // ClientObserver receives lifecycle events and logs.

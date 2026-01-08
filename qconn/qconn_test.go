@@ -80,13 +80,14 @@ func TestFullConnectionLifecycle(t *testing.T) {
 
 	quicAddr := packetConn.LocalAddr().String()
 
-	server := NewServer(ServerOpt{
+	server, err := NewServer(ServerOpt{
 		ListenOn:        "",
 		ProvisionTokens: []string{testProvisionToken},
 		Auth:            authManager,
 		Handler:         serverHandler,
 		Observer:        serverObs,
 	})
+	assertNoError(t, err)
 	serverHandler.RegisterHandlers(&server.Router)
 
 	err = server.Serve(ctx, packetConn)
@@ -346,12 +347,13 @@ func TestServerDowntimeRecovery(t *testing.T) {
 	})
 
 	// 1. Start Server.
-	server := NewServer(ServerOpt{
+	server, err := NewServer(ServerOpt{
 		Auth:            authManager,
 		Handler:         serverHandler,
 		Observer:        serverObs,
 		KeepAlivePeriod: 500 * time.Millisecond,
 	})
+	assertNoError(t, err)
 	authManager.SetStatus(id, qdef.StatusAuthorized)
 
 	err = server.Serve(ctx, packetConn)
@@ -490,12 +492,15 @@ func TestProvisioningRetry(t *testing.T) {
 
 	serverHandler := qmock.NewTestStreamHandler(t)
 	serverHandler.Auth = auth
-	server := NewServer(ServerOpt{
+	server, err := NewServer(ServerOpt{
 		Auth:            auth,
 		ProvisionTokens: []string{testProvisionToken},
 		Handler:         serverHandler,
 		Observer:        qmock.NewTestObserver(ctx, t),
 	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
 
 	packetConn, err := net.ListenPacket("udp", addr)
 	if err != nil {
@@ -542,12 +547,13 @@ func TestClientObserver(t *testing.T) {
 
 	serverHandler := qmock.NewTestStreamHandler(t)
 	serverHandler.Auth = authManager
-	server := NewServer(ServerOpt{
+	server, err := NewServer(ServerOpt{
 		ProvisionTokens: []string{testProvisionToken},
 		Auth:            authManager,
 		Handler:         serverHandler,
 		Observer:        serverObs,
 	})
+	assertNoError(t, err)
 
 	err = server.Serve(ctx, packetConn)
 	assertNoError(t, err)
@@ -609,12 +615,13 @@ func TestConnectionReliability(t *testing.T) {
 		sObs := qmock.NewTestObserver(ctx, t)
 		serverHandler := qmock.NewTestStreamHandler(t)
 		serverHandler.Auth = auth
-		server := NewServer(ServerOpt{
+		server, err := NewServer(ServerOpt{
 			Auth:            auth,
 			KeepAlivePeriod: 100 * time.Millisecond,
 			Observer:        sObs,
 			Handler:         serverHandler,
 		})
+		assertNoError(t, err)
 		auth.SetStatus(id, qdef.StatusAuthorized)
 
 		sConn, err := net.ListenPacket("udp", "127.0.0.1:0")

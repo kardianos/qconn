@@ -28,13 +28,17 @@ func TestSimpleClientAPI(t *testing.T) {
 	hub := anex.NewHub(0)
 	auth := qmock.NewInMemoryAuthorizationManager()
 	obs := qmock.NewTestObserver(ctx, t)
-	server := qconn.NewServer(qconn.ServerOpt{
-		Auth:            auth,
-		Handler:         hub,
-		Listener:        hub,
-		ProvisionTokens: []string{secretToken},
-		Observer:        obs,
+	server, err := qconn.NewServer(qconn.ServerOpt{
+		Auth:                 auth,
+		Handler:              hub,
+		Listener:             hub,
+		ProvisionTokens:      []string{secretToken},
+		Observer:             obs,
+		ProvisioningInterval: 1 * time.Millisecond, // Allow rapid provisioning in tests
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Authorize loop in background
 	go func() {
 		for {
@@ -64,13 +68,11 @@ func TestSimpleClientAPI(t *testing.T) {
 
 	go server.Serve(ctx, packetConn)
 	hub.SetRoleDef("requester", anex.RoleConfig{
-		SendsTo: []string{"printer"},
+		SendsTo: []string{"printer", "list-machines"},
 	})
 	hub.SetRoleDef("provider", anex.RoleConfig{
 		Provides: []string{"printer"},
 	})
-	hub.SetStaticAuthorization("requester-01", []string{"requester"})
-	hub.SetStaticAuthorization("provider-01", []string{"provider"})
 
 	// 2. Setup Provider
 	provDir, _ := os.MkdirTemp("", "qconn-prov-*")
@@ -92,6 +94,9 @@ func TestSimpleClientAPI(t *testing.T) {
 		t.Fatalf("Provider failed to start: %v", err)
 	}
 
+	// Wait briefly to avoid provisioning race with requester.
+	time.Sleep(100 * time.Millisecond)
+
 	// 3. Setup Requester
 	reqDir, _ := os.MkdirTemp("", "qconn-req-*")
 	defer os.RemoveAll(reqDir)
@@ -103,8 +108,38 @@ func TestSimpleClientAPI(t *testing.T) {
 		t.Fatalf("Requester failed to start: %v", err)
 	}
 
-	// 4. Test Discovery & Request
+	// 4. Wait for both clients to connect and discover their fingerprints.
+	var requesterFP, providerFP string
 	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		states := hub.ListHostStates(false)
+		for _, s := range states {
+			if s.Identity.Hostname == "requester-01" && s.Online {
+				requesterFP = s.Identity.Fingerprint
+			}
+			if s.Identity.Hostname == "provider-01" && s.Online && len(s.Identity.Devices) > 0 {
+				providerFP = s.Identity.Fingerprint
+				providerID = providerFP
+			}
+		}
+		if requesterFP != "" && providerFP != "" {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	if requesterFP == "" || providerFP == "" {
+		t.Fatalf("clients did not connect in time (requester: %v, provider: %v)", requesterFP != "", providerFP != "")
+	}
+
+	// Set up role authorization now that we know the fingerprints.
+	hub.SetStaticAuthorization(requesterFP, []string{"requester"})
+	hub.SetStaticAuthorization(providerFP, []string{"provider"})
+	hub.OnStateChange(qdef.Identity{Fingerprint: requesterFP, Hostname: "requester-01"}, qdef.StateAuthorized)
+	hub.OnStateChange(qdef.Identity{Fingerprint: providerFP, Hostname: "provider-01"}, qdef.StateAuthorized)
+
+	// 5. Test Discovery
+	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		hosts, err := reqClient.ListMachines(ctx, false)
 		if err == nil {
@@ -148,15 +183,28 @@ func TestDeviceProviders(t *testing.T) {
 
 	hub := anex.NewHub(0)
 	auth := qmock.NewInMemoryAuthorizationManager()
-	server := qconn.NewServer(qconn.ServerOpt{
+	obs := qmock.NewTestObserver(ctx, t)
+	server, err := qconn.NewServer(qconn.ServerOpt{
 		Auth:     auth,
 		Handler:  hub,
 		Listener: hub,
+		Observer: obs,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	packetConn, _ := net.ListenPacket("udp", "127.0.0.1:0")
 	_, port, _ := net.SplitHostPort(packetConn.LocalAddr().String())
 	serverAddr := "localhost:" + port
 	go server.Serve(ctx, packetConn)
+
+	// Register hub handlers on the server router.
+	hub.RegisterHandlers(&server.Router)
+
+	// Set up role that allows list-machines.
+	hub.SetRoleDef("device-provider", anex.RoleConfig{
+		SendsTo: []string{"list-machines"},
+	})
 
 	provID := qdef.Identity{Hostname: "provider-timer"}
 	certPEM, keyPEM, _ := auth.IssueClientCertificate(&provID)
@@ -166,7 +214,11 @@ func TestDeviceProviders(t *testing.T) {
 		keyPEM:     keyPEM,
 		rootCACert: auth.RootCert(),
 	}
+
+	// Set up authorization for this client's fingerprint.
+	hub.SetStaticAuthorization(provID.Fingerprint, []string{"device-provider"})
 	auth.AuthorizeAll()
+
 	client := NewClient(serverAddr, store)
 
 	// 1. Static Provider

@@ -53,16 +53,28 @@ func (r *StreamRouter) Dispatch(ctx context.Context, id Identity, msg Message, s
 	if !ok {
 		return false
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
+
+	// Helper to send error response. Returns false if encoding fails.
+	sendError := func(errMsg string) bool {
+		resp := Message{
+			ID:    msg.ID,
+			Error: errMsg,
+		}
+		return cbor.NewEncoder(stream).Encode(resp) == nil
+	}
+
+	// Recover from panics in handlers to prevent connection corruption.
+	defer func() {
+		if p := recover(); p != nil {
+			sendError(fmt.Sprintf("handler panic in %s/%s: %v", msg.Target.Service, msg.Target.Type, p))
+		}
+	}()
 
 	// Use reflection to call the handler.
 	reqPtr := reflect.New(handler.reqType)
 	if err := cbor.Unmarshal(msg.Payload, reqPtr.Interface()); err != nil {
-		resp := Message{
-			ID:    msg.ID,
-			Error: fmt.Sprintf("failed to unmarshal request: %v", err),
-		}
-		cbor.NewEncoder(stream).Encode(resp)
+		sendError(fmt.Sprintf("failed to unmarshal request: %v", err))
 		return true
 	}
 
@@ -74,21 +86,13 @@ func (r *StreamRouter) Dispatch(ctx context.Context, id Identity, msg Message, s
 
 	respErr := results[1].Interface()
 	if respErr != nil {
-		resp := Message{
-			ID:    msg.ID,
-			Error: respErr.(error).Error(),
-		}
-		cbor.NewEncoder(stream).Encode(resp)
+		sendError(respErr.(error).Error())
 		return true
 	}
 
 	rawResp, err := cbor.Marshal(results[0].Interface())
 	if err != nil {
-		resp := Message{
-			ID:    msg.ID,
-			Error: fmt.Sprintf("failed to marshal response: %v", err),
-		}
-		cbor.NewEncoder(stream).Encode(resp)
+		sendError(fmt.Sprintf("failed to marshal response: %v", err))
 		return true
 	}
 
@@ -96,6 +100,7 @@ func (r *StreamRouter) Dispatch(ctx context.Context, id Identity, msg Message, s
 		ID:      msg.ID,
 		Payload: rawResp,
 	}
-	cbor.NewEncoder(stream).Encode(resp)
+	// If encoding fails, stream is likely corrupted; nothing more we can do.
+	_ = cbor.NewEncoder(stream).Encode(resp)
 	return true
 }

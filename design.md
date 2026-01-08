@@ -42,10 +42,32 @@ Clients can be in one of three statuses:
 ### mTLS & Fingerprinting
 Security is based on Mutual TLS (mTLS) over QUIC. Every machine has a unique certificate fingerprint used for persistent identification regardless of address changes.
 
+### Provisioning Security
+Provisioning tokens allow initial system connection but grant **no operational access**:
+- Provisioning clients can only call the provisioning endpoint
+- All other service calls are blocked at the transport layer
+- After provisioning, clients idle until authorized by an administrator
+- Authorization is granted per-fingerprint, never by hostname alone
+
+### Certificate Flow (CSR-Based)
+Private keys never leave the client:
+1. Client generates keypair locally
+2. Client sends Certificate Signing Request (CSR) to server
+3. Server validates and signs, returns certificate only
+4. Client stores certificate with its locally-generated key
+
+### Role Management
+Roles are managed **server-side only**:
+- Client certificates contain identity (hostname, fingerprint) but not roles
+- Roles are assigned via `Hub.staticAuthorizations` keyed by fingerprint
+- Role lookups use fingerprint only; hostname fallback is not permitted
+- The hub is the trusted authority for role assignment
+
 ### Automated Renewal
 To minimize the exposure of revoked status, certificates have a short validity period:
 - **Default Validity**: 45 days (configurable).
 - **Renewal Window**: Automatic renewal starts when 15 days remain (configurable).
+- **Rate Limiting**: Renewals are rate-limited to prevent abuse.
 - **Interface**: The `Renew` function is automatically invoked by clients to obtain fresh credentials.
 
 ### Garbage Collection
@@ -53,11 +75,18 @@ Once a certificate's end date has passed, any associated revocation status can b
 
 ## Routing & Roles
 
-### Unified Admin Role
-A separate "Query" role is no longer used. Instead, `anex` registers with its own hub to provide admin functions. Authorized admin clients can:
-- Query the state of all hosts and devices.
-- Provision new unprovisioned clients.
-- Revoke existing clients.
+### Authorization Model
+All message routing is subject to role-based authorization:
+- **SendsTo**: Roles define which job types a client can submit messages to
+- **Provides**: Roles define which job types a client can receive/handle
+- **No Self-Send Bypass**: Even messages to self require proper role authorization
+
+### Admin Endpoints
+Admin functions use role-based authorization with different access levels:
+- **`list-machines`**: Query endpoint, accessible to roles that need discovery (e.g., for broadcast)
+- **`provision`**: Administrative action, restricted to admin roles only
+- Both use `canSend` checks against their respective job types
+- Unauthorized calls are rejected with role error
 
 ### Message Flow
 1. **Submit**: A submitter sends a message to a `(Type, Machine, Device)`.

@@ -25,13 +25,17 @@ func TestRoleBasedRouting(t *testing.T) {
 	})
 
 	auth := qmock.NewInMemoryAuthorizationManager()
-	server := qconn.NewServer(qconn.ServerOpt{
-		Auth:            auth,
-		Handler:         hub,
-		Listener:        hub,
-		ProvisionTokens: []string{"secret"},
-		Observer:        qmock.NewTestObserver(ctx, t),
+	server, err := qconn.NewServer(qconn.ServerOpt{
+		Auth:                 auth,
+		Handler:              hub,
+		Listener:             hub,
+		ProvisionTokens:      []string{"secret"},
+		Observer:             qmock.NewTestObserver(ctx, t),
+		ProvisioningInterval: 1 * time.Millisecond, // Allow rapid provisioning in tests
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	hub.RegisterHandlers(&server.Router)
 
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -73,9 +77,6 @@ func TestRoleBasedRouting(t *testing.T) {
 	managerClient.SetResolver(res)
 	managerClient.SetObserver(qmock.NewTestObserver(ctx, t))
 
-	// Pre-authorize by hostname.
-	hub.SetStaticAuthorization("worker-01", []string{"worker"})
-	hub.SetStaticAuthorization("manager-01", []string{"manager"})
 	auth.AuthorizeAll()
 
 	if err := workerClient.Start(ctx); err != nil {
@@ -111,6 +112,15 @@ func TestRoleBasedRouting(t *testing.T) {
 	if workerFingerprint == "" || managerFingerprint == "" {
 		t.Fatalf("clients did not connect in time (worker: %v, manager: %v)", workerFingerprint != "", managerFingerprint != "")
 	}
+
+	// Now that we know the fingerprints, set up role authorizations.
+	// This also triggers OnStateChange to reassign roles.
+	hub.SetStaticAuthorization(workerFingerprint, []string{"worker"})
+	hub.SetStaticAuthorization(managerFingerprint, []string{"manager"})
+
+	// Re-trigger state change to assign roles.
+	hub.OnStateChange(qdef.Identity{Fingerprint: workerFingerprint, Hostname: "worker-01"}, qdef.StateAuthorized)
+	hub.OnStateChange(qdef.Identity{Fingerprint: managerFingerprint, Hostname: "manager-01"}, qdef.StateAuthorized)
 
 	// Wait a bit more for the connections to be fully usable.
 	time.Sleep(1 * time.Second)
@@ -148,7 +158,7 @@ func TestRoleBasedRouting(t *testing.T) {
 		_, err := qclient.Request[ComputeReq, ComputeResp](managerClient, ctx, target, &req)
 		if err == nil {
 			t.Error("expected unauthorized error, got nil")
-		} else if err.Error() != "role [manager] not authorized to send job type \"compute\"" {
+		} else if err.Error() != "qconn: unauthorized: role [manager] not authorized to send job type \"compute\"" {
 			t.Errorf("unexpected error: %v", err)
 		}
 	})
@@ -173,7 +183,7 @@ func TestRoleBasedRouting(t *testing.T) {
 		_, err := qclient.Request[ComputeReq, ComputeResp](managerClient, ctx, target, &req)
 		if err == nil {
 			t.Error("expected unauthorized error, got nil")
-		} else if err.Error() != "target \""+workerFingerprint+"\" not authorized to provide job type \"compute\"" {
+		} else if err.Error() != "qconn: unauthorized: target \""+workerFingerprint+"\" not authorized to provide job type \"compute\"" {
 			t.Errorf("unexpected error: %v", err)
 		}
 	})

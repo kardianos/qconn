@@ -13,12 +13,46 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/kardianos/qconn/qdef"
+	"github.com/kardianos/qconn/qstate"
 	"github.com/quic-go/quic-go"
 )
 
+var clientTransitions = []qstate.Transition[qdef.ClientState]{
+	// From Disconnected
+	{From: qdef.StateDisconnected, To: qdef.StateProvisioning, Name: "start_provision"},
+	{From: qdef.StateDisconnected, To: qdef.StateConnecting, Name: "start_connect"},
+
+	// From Provisioning
+	{From: qdef.StateProvisioning, To: qdef.StateProvisioning, Name: "provision_retry"},
+	{From: qdef.StateProvisioning, To: qdef.StateProvisioned, Name: "provision_success"},
+	{From: qdef.StateProvisioning, To: qdef.StateDisconnected, Name: "provision_failure"},
+
+	// From Provisioned
+	{From: qdef.StateProvisioned, To: qdef.StateConnecting, Name: "connect_after_provision"},
+	{From: qdef.StateProvisioned, To: qdef.StateDisconnected, Name: "provision_reset"},
+
+	// From Connecting
+	{From: qdef.StateConnecting, To: qdef.StateConnecting, Name: "connection_retry"},
+	{From: qdef.StateConnecting, To: qdef.StateConnected, Name: "connection_established"},
+	{From: qdef.StateConnecting, To: qdef.StateDisconnected, Name: "connection_failed"},
+
+	// From Connected
+	{From: qdef.StateConnected, To: qdef.StateAuthorized, Name: "authorized"},
+	{From: qdef.StateConnected, To: qdef.StateDisconnected, Name: "connection_lost"},
+
+	// From Authorized
+	{From: qdef.StateAuthorized, To: qdef.StateRenewing, Name: "start_renewal"},
+	{From: qdef.StateAuthorized, To: qdef.StateDisconnected, Name: "connection_lost"},
+
+	// From Renewing
+	{From: qdef.StateRenewing, To: qdef.StateAuthorized, Name: "renewal_complete"},
+	{From: qdef.StateRenewing, To: qdef.StateDisconnected, Name: "renewal_failed_disconnect"},
+}
+
 // Client implements the resilient QUIC client.
 type Client struct {
-	opt ClientOpt
+	opt   ClientOpt
+	state *qstate.Machine[qdef.ClientState]
 
 	mu                 sync.RWMutex
 	conn               *quic.Conn
@@ -49,9 +83,20 @@ func NewClient(opt ClientOpt) *Client {
 	if opt.ResolverRefresh == 0 {
 		opt.ResolverRefresh = 5 * time.Minute
 	}
-	return &Client{
+	var c *Client
+	c = &Client{
 		opt: opt,
+		state: qstate.New(
+			qdef.StateDisconnected,
+			clientTransitions,
+			func(from, to qdef.ClientState, name string) {
+				if c.opt.Observer != nil {
+					c.opt.Observer.OnStateChange(c.identity, to)
+				}
+			},
+		),
 	}
+	return c
 }
 
 func (c *Client) logf(format string, v ...interface{}) {
@@ -72,12 +117,6 @@ func (c *Client) SetObserver(o qdef.ClientObserver) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.opt.Observer = o
-}
-
-func (c *Client) notifyState(state qdef.ClientState) {
-	if c.opt.Observer != nil {
-		c.opt.Observer.OnStateChange(c.identity, state)
-	}
 }
 
 // Connect starts the client and its connection supervisor.
@@ -120,10 +159,10 @@ func (c *Client) getServerName() string {
 }
 
 func (c *Client) runProvisioning(ctx context.Context) error {
-	c.notifyState(qdef.StateProvisioning)
+	c.state.MustTransitionTo(qdef.StateProvisioning)
 	pt := c.opt.CredentialStore.ProvisionToken()
 	if pt == "" {
-		return fmt.Errorf("failed to get provision token: empty")
+		return qdef.ErrProvisionTokenEmpty
 	}
 	provCA, err := qdef.GenerateDerivedCA(pt)
 	if err != nil {
@@ -155,20 +194,30 @@ func (c *Client) runProvisioning(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to dial server for provisioning: %w", err)
 	}
-	defer conn.CloseWithError(0, "provisioning done")
+	defer func() { _ = conn.CloseWithError(0, "provisioning done") }()
 
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to open provisioning stream: %w", err)
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 
 	id, err := c.opt.CredentialStore.GetIdentity()
 	if err != nil {
 		return fmt.Errorf("failed to get identity: %w", err)
 	}
 
-	rawPayload, _ := cbor.Marshal(id)
+	// Generate CSR locally - private key never leaves the client.
+	csrPEM, keyPEM, err := qdef.CreateCSR(id.Hostname)
+	if err != nil {
+		return fmt.Errorf("failed to create CSR: %w", err)
+	}
+
+	req := qdef.ProvisioningRequest{
+		Hostname: id.Hostname,
+		CSRPEM:   csrPEM,
+	}
+	rawPayload, _ := cbor.Marshal(req)
 	msg := qdef.Message{
 		ID: c.getNextID(),
 		Target: qdef.Addr{
@@ -194,17 +243,8 @@ func (c *Client) runProvisioning(ctx context.Context) error {
 		return fmt.Errorf("failed to unmarshal provisioning payload: %w", err)
 	}
 
-	/*
-		block, _ := pem.Decode(payload.CertPEM)
-		if block != nil {
-			leaf, _ := x509.ParseCertificate(block.Bytes)
-			if leaf != nil {
-				id.Fingerprint = qdef.FingerprintHex(leaf)
-			}
-		}
-	*/
-
-	if err := c.opt.CredentialStore.SaveCredentials(id, payload.CertPEM, payload.KeyPEM); err != nil {
+	// Save credentials with locally-generated private key.
+	if err := c.opt.CredentialStore.SaveCredentials(id, payload.CertPEM, keyPEM); err != nil {
 		return fmt.Errorf("failed to save credentials: %w", err)
 	}
 
@@ -212,29 +252,31 @@ func (c *Client) runProvisioning(ctx context.Context) error {
 }
 
 func (c *Client) runRenewal(ctx context.Context) error {
-	var payload qdef.CredentialResponse
-	if _, err := c.Request(ctx, qdef.Addr{
-		Service: qdef.ServiceSystem,
-		Type:    "renew",
-	}, nil, &payload); err != nil {
-		return err
-	}
 	id, err := c.opt.CredentialStore.GetIdentity()
 	if err != nil {
 		return err
 	}
 
-	/*
-		block, _ := pem.Decode(payload.CertPEM)
-		if block != nil {
-			leaf, _ := x509.ParseCertificate(block.Bytes)
-			if leaf != nil {
-				id.Fingerprint = qdef.FingerprintHex(leaf)
-			}
-		}
-	*/
+	// Generate new CSR locally - private key never leaves the client.
+	csrPEM, keyPEM, err := qdef.CreateCSR(id.Hostname)
+	if err != nil {
+		return fmt.Errorf("failed to create CSR for renewal: %w", err)
+	}
 
-	return c.opt.CredentialStore.SaveCredentials(id, payload.CertPEM, payload.KeyPEM)
+	req := qdef.RenewalRequest{
+		CSRPEM: csrPEM,
+	}
+
+	var payload qdef.CredentialResponse
+	if _, err := c.Request(ctx, qdef.Addr{
+		Service: qdef.ServiceSystem,
+		Type:    "renew",
+	}, req, &payload); err != nil {
+		return err
+	}
+
+	// Save credentials with locally-generated private key.
+	return c.opt.CredentialStore.SaveCredentials(id, payload.CertPEM, keyPEM)
 }
 
 // SetDevices updates the client's internal list of supported device types.
@@ -275,14 +317,14 @@ func (c *Client) Request(ctx context.Context, target qdef.Addr, payload interfac
 	c.mu.RUnlock()
 
 	if conn == nil || conn.Context().Err() != nil {
-		return 0, fmt.Errorf("client not connected")
+		return 0, qdef.ErrNotConnected
 	}
 
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		return 0, err
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 
 	var rawPayload []byte
 	if payload != nil {
@@ -303,18 +345,17 @@ func (c *Client) Request(ctx context.Context, target qdef.Addr, payload interfac
 		return msgID, err
 	}
 
-	if response != nil || true { // Always decode to check for Error
-		var respMsg qdef.Message
-		if err := cbor.NewDecoder(stream).Decode(&respMsg); err != nil {
+	// Always decode response to check for errors from the server.
+	var respMsg qdef.Message
+	if err := cbor.NewDecoder(stream).Decode(&respMsg); err != nil {
+		return msgID, err
+	}
+	if respMsg.Error != "" {
+		return msgID, errors.New(respMsg.Error)
+	}
+	if response != nil {
+		if err := cbor.Unmarshal(respMsg.Payload, response); err != nil {
 			return msgID, err
-		}
-		if respMsg.Error != "" {
-			return msgID, errors.New(respMsg.Error)
-		}
-		if response != nil {
-			if err := cbor.Unmarshal(respMsg.Payload, response); err != nil {
-				return msgID, err
-			}
 		}
 	}
 
@@ -359,7 +400,7 @@ func (c *Client) supervisor(ctx context.Context) {
 				if provErr := c.runProvisioning(ctx); provErr != nil {
 					c.logf("qconn: provisioning failed: %v", provErr)
 				} else {
-					c.notifyState(qdef.StateProvisioned)
+					c.state.MustTransitionTo(qdef.StateProvisioned)
 					// Reload tlsConfig immediately.
 					tlsConfig, _ = c.getTLSConfig()
 				}
@@ -403,7 +444,7 @@ func (c *Client) supervisor(ctx context.Context) {
 			c.mu.Lock()
 			if c.conn != nil {
 				_ = c.conn.CloseWithError(0, "client shutting down")
-				c.notifyState(qdef.StateDisconnected)
+				c.state.MustTransitionTo(qdef.StateDisconnected)
 			}
 			c.mu.Unlock()
 			return
@@ -455,7 +496,7 @@ func (c *Client) supervisor(ctx context.Context) {
 				c.lastAddr = nextAddr
 				if c.conn != nil {
 					_ = c.conn.CloseWithError(0, "address changed")
-					c.notifyState(qdef.StateDisconnected)
+					c.state.MustTransitionTo(qdef.StateDisconnected)
 				}
 			}
 			c.mu.Unlock()
@@ -476,7 +517,7 @@ func (c *Client) attemptConnect(ctx context.Context, tlsConfig *tls.Config) {
 		if c.conn.Context().Err() == nil {
 			return // Already connected.
 		}
-		c.notifyState(qdef.StateDisconnected)
+		c.state.MustTransitionTo(qdef.StateDisconnected)
 	}
 
 	addr, err := c.opt.Resolver.Resolve(ctx, c.opt.ServerHostname)
@@ -486,7 +527,7 @@ func (c *Client) attemptConnect(ctx context.Context, tlsConfig *tls.Config) {
 	}
 	c.lastAddr = addr.String()
 
-	c.notifyState(qdef.StateConnecting)
+	c.state.MustTransitionTo(qdef.StateConnecting)
 	c.logf("qconn: attempting to connect to %s", c.lastAddr)
 
 	dto := c.opt.DialTimeout
@@ -512,7 +553,7 @@ func (c *Client) attemptConnect(ctx context.Context, tlsConfig *tls.Config) {
 	}
 
 	c.conn = conn
-	c.notifyState(qdef.StateConnected)
+	c.state.MustTransitionTo(qdef.StateConnected)
 	c.logf("qconn: connection established to %s", c.lastAddr)
 	if c.opt.Handler != nil {
 		go c.opt.Handler.OnConnect(conn)

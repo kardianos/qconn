@@ -19,10 +19,21 @@ import (
 var (
 	// OIDProvisioningIdentity is a custom extension to identify provisioning certificates.
 	OIDProvisioningIdentity = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 1}
-
-	// OIDRoles is a custom extension to store roles associated with an identity.
-	OIDRoles = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 2}
 )
+
+// randomSerialNumber generates a cryptographically random serial number for certificates.
+// Serial numbers should be unique and unpredictable per RFC 5280.
+func randomSerialNumber() (*big.Int, error) {
+	// Use 128 bits of randomness (16 bytes) for the serial number.
+	// This provides sufficient uniqueness and unpredictability.
+	serialBytes := make([]byte, 16)
+	if _, err := rand.Read(serialBytes); err != nil {
+		return nil, fmt.Errorf("failed to generate random serial: %w", err)
+	}
+	// Ensure the serial number is positive by clearing the high bit.
+	serialBytes[0] &= 0x7F
+	return new(big.Int).SetBytes(serialBytes), nil
+}
 
 // Fingerprint returns the SHA-256 hash of the provided data.
 func Fingerprint(data []byte) [32]byte {
@@ -49,8 +60,13 @@ func CreateCA() (caCert *x509.Certificate, caKey *ecdsa.PrivateKey, err error) {
 		return nil, nil, err
 	}
 
+	serial, err := randomSerialNumber()
+	if err != nil {
+		return nil, nil, err
+	}
+
 	template := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
+		SerialNumber:          serial,
 		Subject:               pkix.Name{CommonName: "qconn Test CA"},
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().Add(24 * time.Hour),
@@ -70,14 +86,20 @@ func CreateCA() (caCert *x509.Certificate, caKey *ecdsa.PrivateKey, err error) {
 
 // CreateCert creates a new certificate signed by the provided CA.
 // It includes the hostname in the Subject Alternative Name (SAN) field for modern TLS validation.
-func CreateCert(caCert *x509.Certificate, caKey *ecdsa.PrivateKey, hostname string, roles []string, isServer bool) (certPEM []byte, keyPEM []byte, err error) {
+// Note: Roles are managed server-side and are not embedded in certificates.
+func CreateCert(caCert *x509.Certificate, caKey *ecdsa.PrivateKey, hostname string, isServer bool) (certPEM []byte, keyPEM []byte, err error) {
 	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, nil, err
 	}
 
+	serial, err := randomSerialNumber()
+	if err != nil {
+		return nil, nil, err
+	}
+
 	template := &x509.Certificate{
-		SerialNumber: big.NewInt(time.Now().Unix()),
+		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: hostname},
 		DNSNames:     []string{hostname}, // Use SAN for modern validation.
 		NotBefore:    time.Now().Add(-time.Hour),
@@ -90,16 +112,6 @@ func CreateCert(caCert *x509.Certificate, caKey *ecdsa.PrivateKey, hostname stri
 	}
 	if isServer {
 		template.ExtKeyUsage = append(template.ExtKeyUsage, x509.ExtKeyUsageServerAuth)
-	}
-	if len(roles) > 0 {
-		roleBytes, err := asn1.Marshal(roles)
-		if err == nil {
-			template.ExtraExtensions = append(template.ExtraExtensions, pkix.Extension{
-				Id:       OIDRoles,
-				Critical: false,
-				Value:    roleBytes,
-			})
-		}
 	}
 
 	certBytes, err := x509.CreateCertificate(rand.Reader, template, caCert, &privKey.PublicKey, caKey)
@@ -180,8 +192,13 @@ func GenerateProvisioningIdentity(ca tls.Certificate) (tls.Certificate, error) {
 		return tls.Certificate{}, err
 	}
 
+	serial, err := randomSerialNumber()
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
 	template := &x509.Certificate{
-		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: "provision"},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(1 * time.Hour),
@@ -209,15 +226,97 @@ func GenerateProvisioningIdentity(ca tls.Certificate) (tls.Certificate, error) {
 	return leafCert, nil
 }
 
-// ExtractRolesFromCert pulls the roles from the custom X.509 extension.
-func ExtractRolesFromCert(cert *x509.Certificate) []string {
-	for _, ext := range cert.Extensions {
-		if ext.Id.Equal(OIDRoles) {
-			var roles []string
-			if _, err := asn1.Unmarshal(ext.Value, &roles); err == nil {
-				return roles
+// CreateCSR generates a new private key and certificate signing request.
+// The private key stays with the client; only the CSR is sent to the server.
+func CreateCSR(hostname string) (csrPEM []byte, keyPEM []byte, err error) {
+	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	template := &x509.CertificateRequest{
+		Subject:  pkix.Name{CommonName: hostname},
+		DNSNames: []string{hostname},
+	}
+	if ip := net.ParseIP(hostname); ip != nil {
+		template.IPAddresses = append(template.IPAddresses, ip)
+	}
+
+	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, template, privKey)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	csrPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrBytes})
+	keyBytes, err := x509.MarshalECPrivateKey(privKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
+	return csrPEM, keyPEM, nil
+}
+
+// SignCSR signs a certificate signing request with the CA and returns the certificate.
+// The server never sees the client's private key.
+// DEPRECATED: Use SignCSRWithValidation for new code to ensure hostname validation.
+func SignCSR(caCert *x509.Certificate, caKey *ecdsa.PrivateKey, csrPEM []byte, isServer bool) (certPEM []byte, err error) {
+	return SignCSRWithValidation(caCert, caKey, csrPEM, "", isServer)
+}
+
+// SignCSRWithValidation signs a CSR after validating that it matches the expected hostname.
+// If expectedHostname is non-empty, the CSR's CommonName and DNSNames must match it.
+// This prevents identity spoofing where a client requests a certificate for a different identity.
+func SignCSRWithValidation(caCert *x509.Certificate, caKey *ecdsa.PrivateKey, csrPEM []byte, expectedHostname string, isServer bool) (certPEM []byte, err error) {
+	block, _ := pem.Decode(csrPEM)
+	if block == nil || block.Type != "CERTIFICATE REQUEST" {
+		return nil, fmt.Errorf("failed to decode CSR PEM")
+	}
+
+	csr, err := x509.ParseCertificateRequest(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse CSR: %w", err)
+	}
+
+	if err := csr.CheckSignature(); err != nil {
+		return nil, fmt.Errorf("CSR signature invalid: %w", err)
+	}
+
+	// Validate that CSR matches expected hostname to prevent identity spoofing.
+	if expectedHostname != "" {
+		if csr.Subject.CommonName != expectedHostname {
+			return nil, fmt.Errorf("CSR CommonName %q does not match expected hostname %q", csr.Subject.CommonName, expectedHostname)
+		}
+		// Validate DNSNames only contain the expected hostname.
+		for _, dns := range csr.DNSNames {
+			if dns != expectedHostname {
+				return nil, fmt.Errorf("CSR contains unauthorized DNS name %q (expected %q)", dns, expectedHostname)
 			}
 		}
 	}
-	return nil
+
+	serial, err := randomSerialNumber()
+	if err != nil {
+		return nil, err
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      csr.Subject,
+		DNSNames:     csr.DNSNames,
+		IPAddresses:  csr.IPAddresses,
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(45 * 24 * time.Hour), // 45 days default validity
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	if isServer {
+		template.ExtKeyUsage = append(template.ExtKeyUsage, x509.ExtKeyUsageServerAuth)
+	}
+
+	certBytes, err := x509.CreateCertificate(rand.Reader, template, caCert, csr.PublicKey, caKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certBytes}), nil
 }

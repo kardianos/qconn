@@ -18,11 +18,14 @@ func TestCertificateRenewal(t *testing.T) {
 
 	h := qmock.NewTestStreamHandler(t)
 	h.Auth = auth
-	server := NewServer(ServerOpt{
+	server, err := NewServer(ServerOpt{
 		Auth:            auth,
 		ProvisionTokens: []string{"super-secret"},
 		Handler:         h,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

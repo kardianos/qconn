@@ -64,17 +64,14 @@ func (h *Hub) getIdentity(fingerprint string) qdef.Identity {
 }
 
 // AuthorizeRoles filters requested roles based on static configuration.
-func (h *Hub) AuthorizeRoles(fingerprint string, hostname string, requested []string) []string {
+// Authorization is by fingerprint only; hostname is not used for lookup.
+func (h *Hub) AuthorizeRoles(fingerprint string, requested []string) []string {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
 	allowed, ok := h.staticAuthorizations[fingerprint]
 	if !ok {
-		// Fallback to hostname for backward compatibility or initial provisioning.
-		allowed, ok = h.staticAuthorizations[hostname]
-		if !ok {
-			return nil
-		}
+		return nil
 	}
 
 	var authorized []string
@@ -145,8 +142,14 @@ func (h *Hub) OnConnect(conn *quic.Conn) {
 
 // OnStateChange implements qconn.StateListener.
 func (h *Hub) OnStateChange(id qdef.Identity, state qdef.ClientState) {
-	// We might want to store more detailed state here, but for now just update identity if it's connected.
 	if state == qdef.StateConnected || state == qdef.StateAuthorized {
+		// Assign roles from server-side authorization (not from certificate).
+		h.mu.RLock()
+		roles, ok := h.staticAuthorizations[id.Fingerprint]
+		h.mu.RUnlock()
+		if ok {
+			id.Roles = roles
+		}
 		h.hostStates.Store(id.Fingerprint, &id)
 	}
 }
@@ -156,7 +159,7 @@ func (h *Hub) GetConnectionByMachine(fingerprint string) (*quic.Conn, error) {
 	val, ok := h.activeConns.Load(fingerprint)
 	if !ok {
 		id := h.getIdentity(fingerprint)
-		return nil, fmt.Errorf("machine %s not connected", id)
+		return nil, fmt.Errorf("%w: machine %s not connected", qdef.ErrTargetNotFound, id)
 	}
 	return val.(*quic.Conn), nil
 }
@@ -205,19 +208,16 @@ func (h *Hub) Route(ctx context.Context, senderID qdef.Identity, msg qdef.Messag
 		if err == nil {
 			// Check if sender has permission to send this job type.
 			if senderID.Fingerprint == "" {
-				return nil, fmt.Errorf("sender fingerprint required")
+				return nil, fmt.Errorf("%w: sender fingerprint required", qdef.ErrUnauthorized)
 			}
-			if senderID.Fingerprint != msg.Target.Machine {
-				senderRoles := senderID.Roles
-				if !h.canSend(senderRoles, msg.Target.Type) {
-					return nil, fmt.Errorf("role %v not authorized to send job type %q", senderRoles, msg.Target.Type)
-				}
+			if !h.canSend(senderID.Roles, msg.Target.Type) {
+				return nil, fmt.Errorf("%w: role %v not authorized to send job type %q", qdef.ErrUnauthorized, senderID.Roles, msg.Target.Type)
 			}
 
 			// Check if receiver has permission to provide this job type.
 			receiverRoles := h.getReceiverRoles(msg.Target.Machine)
 			if !h.canProvide(receiverRoles, msg.Target.Type) {
-				return nil, fmt.Errorf("target %q not authorized to provide job type %q", msg.Target.Machine, msg.Target.Type)
+				return nil, fmt.Errorf("%w: target %q not authorized to provide job type %q", qdef.ErrUnauthorized, msg.Target.Machine, msg.Target.Type)
 			}
 
 			return h.forward(ctx, conn, msg)
@@ -228,7 +228,7 @@ func (h *Hub) Route(ctx context.Context, senderID qdef.Identity, msg qdef.Messag
 			return nil, ctx.Err()
 		case <-time.After(1 * time.Second):
 			if time.Now().After(deadline) {
-				return nil, fmt.Errorf("target %v not available after timeout", msg.Target)
+				return nil, fmt.Errorf("%w: target %v not available after timeout", qdef.ErrTargetNotFound, msg.Target)
 			}
 		}
 	}
@@ -288,19 +288,27 @@ func (h *Hub) Request(ctx context.Context, senderID qdef.Identity, target qdef.A
 // Handle implements qdef.StreamHandler.
 func (h *Hub) Handle(ctx context.Context, id qdef.Identity, msg qdef.Message, stream qdef.Stream) {
 	if msg.Target.Service == qdef.ServiceUser {
-		resp, err := h.Route(ctx, id, msg)
+		// Look up the sender's full identity with roles from our stored state.
+		// The server passes identity without roles; we maintain roles server-side.
+		senderID := h.getIdentity(id.Fingerprint)
+		if senderID.Hostname == "" {
+			senderID.Hostname = id.Hostname
+		}
+		if senderID.Address == "" {
+			senderID.Address = id.Address
+		}
+
+		resp, err := h.Route(ctx, senderID, msg)
 		if err != nil {
 			errorMsg := qdef.Message{
 				ID:    msg.ID,
 				Error: err.Error(),
 			}
-			cbor.NewEncoder(stream).Encode(errorMsg)
+			_ = cbor.NewEncoder(stream).Encode(errorMsg)
 			return
 		}
 
-		if err := cbor.NewEncoder(stream).Encode(resp); err != nil {
-			return
-		}
+		_ = cbor.NewEncoder(stream).Encode(resp)
 		return
 	}
 
@@ -308,7 +316,7 @@ func (h *Hub) Handle(ctx context.Context, id qdef.Identity, msg qdef.Message, st
 		ID:    msg.ID,
 		Error: fmt.Sprintf("no handler for %s:%s", msg.Target.Service, msg.Target.Type),
 	}
-	cbor.NewEncoder(stream).Encode(resp)
+	_ = cbor.NewEncoder(stream).Encode(resp)
 }
 
 func (h *Hub) getReceiverRoles(fingerprint string) []string {
@@ -319,20 +327,46 @@ func (h *Hub) getReceiverRoles(fingerprint string) []string {
 }
 
 func (h *Hub) handleDeviceUpdate(ctx context.Context, id qdef.Identity, req *qdef.DeviceUpdateRequest) (*struct{}, error) {
-	id.Type = req.Type
-	id.Devices = req.Devices
+	// Preserve existing roles from our stored state.
+	existingID := h.getIdentity(id.Fingerprint)
+	existingID.Type = req.Type
+	existingID.Devices = req.Devices
+	if existingID.Hostname == "" {
+		existingID.Hostname = id.Hostname
+	}
+	if existingID.Address == "" {
+		existingID.Address = id.Address
+	}
 
-	h.hostStates.Store(id.Fingerprint, &id)
+	h.hostStates.Store(id.Fingerprint, &existingID)
 
 	return &struct{}{}, nil
 }
 
 func (h *Hub) handleListMachines(ctx context.Context, id qdef.Identity, req *qdef.ListMachinesReq) (*qdef.ListMachinesResp, error) {
+	// Look up the sender's full identity with roles from our stored state.
+	// Fall back to passed roles for direct unit test calls.
+	senderID := h.getIdentity(id.Fingerprint)
+	if len(senderID.Roles) == 0 {
+		senderID.Roles = id.Roles
+	}
+	if !h.canSend(senderID.Roles, "list-machines") {
+		return nil, fmt.Errorf("%w: role %v not authorized for list-machines", qdef.ErrUnauthorized, senderID.Roles)
+	}
 	hosts := h.ListHostStates(req.ShowUnprovisioned)
 	return &qdef.ListMachinesResp{Hosts: hosts}, nil
 }
 
 func (h *Hub) handleProvision(ctx context.Context, id qdef.Identity, req *qdef.ProvisionReq) (*struct{}, error) {
+	// Look up the sender's full identity with roles from our stored state.
+	// Fall back to passed roles for direct unit test calls.
+	senderID := h.getIdentity(id.Fingerprint)
+	if len(senderID.Roles) == 0 {
+		senderID.Roles = id.Roles
+	}
+	if !h.canSend(senderID.Roles, "provision") {
+		return nil, fmt.Errorf("%w: role %v not authorized for provision", qdef.ErrUnauthorized, senderID.Roles)
+	}
 	for _, fp := range req.Fingerprint {
 		h.unprovisioned.Delete(fp)
 		h.mu.Lock()

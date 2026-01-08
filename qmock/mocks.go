@@ -86,6 +86,101 @@ func (m *InMemoryAuthorizationManager) SetStatus(id qdef.Identity, status qdef.C
 	m.trigger(id.Fingerprint)
 	return nil
 }
+func (m *InMemoryAuthorizationManager) SignProvisioningCSR(csrPEM []byte, hostname string) ([]byte, error) {
+	// Validate that CSR matches the claimed hostname to prevent identity spoofing.
+	certPEM, err := qdef.SignCSRWithValidation(m.CA.caCert, m.CA.caKey, csrPEM, hostname, false)
+	if err != nil {
+		return nil, err
+	}
+
+	// Track the new client by fingerprint.
+	block, _ := pem.Decode(certPEM)
+	if block != nil {
+		leaf, _ := x509.ParseCertificate(block.Bytes)
+		if leaf != nil {
+			fp := qdef.FingerprintHex(leaf)
+			m.mu.Lock()
+			m.clients[fp] = qdef.StatusUnauthorized
+			m.trigger(fp)
+			m.mu.Unlock()
+		}
+	}
+
+	return certPEM, nil
+}
+
+func (m *InMemoryAuthorizationManager) SignRenewalCSR(csrPEM []byte, fingerprint string) ([]byte, error) {
+	// Verify the client exists and is authorized for renewal.
+	m.mu.RLock()
+	status, ok := m.clients[fingerprint]
+	m.mu.RUnlock()
+
+	if !ok {
+		return nil, fmt.Errorf("%w: fingerprint %s", qdef.ErrUnknownClient, fingerprint)
+	}
+	if status == qdef.StatusRevoked {
+		return nil, qdef.ErrClientRevoked
+	}
+
+	certPEM, err := qdef.SignCSR(m.CA.caCert, m.CA.caKey, csrPEM, false)
+	if err != nil {
+		return nil, err
+	}
+
+	// Track the renewed client by new fingerprint.
+	block, _ := pem.Decode(certPEM)
+	if block != nil {
+		leaf, _ := x509.ParseCertificate(block.Bytes)
+		if leaf != nil {
+			newFP := qdef.FingerprintHex(leaf)
+			m.mu.Lock()
+			// Remove old fingerprint, add new one with same status.
+			delete(m.clients, fingerprint)
+			m.clients[newFP] = status
+			m.trigger(newFP)
+			m.mu.Unlock()
+		}
+	}
+
+	return certPEM, nil
+}
+func (m *InMemoryAuthorizationManager) Revoke(id qdef.Identity) error {
+	if len(id.Fingerprint) == 0 {
+		return errors.New("fingerprint is empty")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.clients[id.Fingerprint] = qdef.StatusRevoked
+	m.trigger(id.Fingerprint)
+	return nil
+}
+func (m *InMemoryAuthorizationManager) AuthorizeRoles(fingerprint string, requested []string) []string {
+	// By default, mock allows all requested roles.
+	return requested
+}
+func (m *InMemoryAuthorizationManager) RootCert() *x509.Certificate { return m.CA.RootCert() }
+
+func (m *InMemoryAuthorizationManager) ServerCertificate() (tls.Certificate, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.serverCert != nil {
+		return *m.serverCert, nil
+	}
+	cert, err := m.CA.IssueServerCertificate(qdef.Identity{Hostname: "localhost"})
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	m.serverCert = &cert
+	return cert, nil
+}
+
+func (m *InMemoryAuthorizationManager) IssueServerCertificate(id qdef.Identity) (tls.Certificate, error) {
+	return m.CA.IssueServerCertificate(id)
+}
+
+// IssueClientCertificate is a test helper that creates a certificate for a client.
+// This bypasses the CSR flow and is only for setting up test fixtures.
+// In production, clients generate their own keys and send CSRs.
 func (m *InMemoryAuthorizationManager) IssueClientCertificate(id *qdef.Identity) ([]byte, []byte, error) {
 	certPEM, keyPEM, err := m.CA.IssueClientCertificate(*id)
 	if err != nil {
@@ -108,42 +203,6 @@ func (m *InMemoryAuthorizationManager) IssueClientCertificate(id *qdef.Identity)
 
 	return certPEM, keyPEM, nil
 }
-func (m *InMemoryAuthorizationManager) Revoke(id qdef.Identity) error {
-	if len(id.Fingerprint) == 0 {
-		return errors.New("fingerprint is empty")
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.clients[id.Fingerprint] = qdef.StatusRevoked
-	m.trigger(id.Fingerprint)
-	return nil
-}
-func (m *InMemoryAuthorizationManager) AuthorizeRoles(fingerprint string, hostname string, requested []string) []string {
-	// By default, mock allows all requested roles.
-	return requested
-}
-func (m *InMemoryAuthorizationManager) RenewClientCertificate(id *qdef.Identity) ([]byte, []byte, error) {
-	return m.IssueClientCertificate(id)
-}
-func (m *InMemoryAuthorizationManager) RootCert() *x509.Certificate { return m.CA.RootCert() }
-
-func (m *InMemoryAuthorizationManager) ServerCertificate() (tls.Certificate, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.serverCert != nil {
-		return *m.serverCert, nil
-	}
-	cert, err := m.CA.IssueServerCertificate(qdef.Identity{Hostname: "localhost"})
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	m.serverCert = &cert
-	return cert, nil
-}
-
-func (m *InMemoryAuthorizationManager) IssueServerCertificate(id qdef.Identity) (tls.Certificate, error) {
-	return m.CA.IssueServerCertificate(id)
-}
 
 // InMemoryCA is a helper for issuing certificates in tests.
 type InMemoryCA struct {
@@ -159,10 +218,10 @@ func NewInMemoryCA() (*InMemoryCA, error) {
 	return &InMemoryCA{caCert: cert, caKey: key}, nil
 }
 func (ca *InMemoryCA) IssueClientCertificate(id qdef.Identity) ([]byte, []byte, error) {
-	return qdef.CreateCert(ca.caCert, ca.caKey, id.Hostname, id.Roles, false)
+	return qdef.CreateCert(ca.caCert, ca.caKey, id.Hostname, false)
 }
 func (ca *InMemoryCA) IssueServerCertificate(id qdef.Identity) (tls.Certificate, error) {
-	certPEM, keyPEM, err := qdef.CreateCert(ca.caCert, ca.caKey, id.Hostname, nil, true)
+	certPEM, keyPEM, err := qdef.CreateCert(ca.caCert, ca.caKey, id.Hostname, true)
 	if err != nil {
 		return tls.Certificate{}, err
 	}

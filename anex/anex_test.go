@@ -25,20 +25,22 @@ func TestAnexRouting(t *testing.T) {
 
 	// 2. Setup QC Server.
 	auth := qmock.NewInMemoryAuthorizationManager()
-	server := qconn.NewServer(qconn.ServerOpt{
+	server, err := qconn.NewServer(qconn.ServerOpt{
 		Auth:     auth,
 		Handler:  hub,
 		Listener: hub,
 		Observer: qmock.NewTestObserver(ctx, t),
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	hub.SetRoleDef("printer-provider", RoleConfig{
 		Provides: []string{"printer"},
 	})
-	// Allow hub itself (no roles in context) to send to any job type?
-	// Actually, let's just make it possible to send if no sender roles are present for now,
-	// or configure the hub's request to have a role.
-	// For simplicity, I'll allow "provide" if no role def exists or if explicitly allowed.
+	hub.SetRoleDef("print-requester", RoleConfig{
+		SendsTo: []string{"printer"},
+	})
 
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -51,10 +53,9 @@ func TestAnexRouting(t *testing.T) {
 	go server.Serve(ctx, packetConn)
 
 	// 3. Setup Provider Client.
-	clientID := qdef.Identity{Hostname: "provider-01", Roles: []string{"printer-provider"}}
+	clientID := qdef.Identity{Hostname: "provider-01"}
 	clientCertPEM, clientKeyPEM, _ := auth.IssueClientCertificate(&clientID)
 	auth.AuthorizeAll()
-	hub.SetStaticAuthorization(clientID.Fingerprint, []string{"printer-provider"})
 
 	provStore := &mockCredentialStore{
 		id:         clientID,
@@ -96,7 +97,10 @@ func TestAnexRouting(t *testing.T) {
 	if fingerprint == "" {
 		t.Fatal("provider client did not register devices in time")
 	}
-	clientID.Fingerprint = fingerprint
+
+	// Now that we know the fingerprint, set up role authorization and re-trigger state change.
+	hub.SetStaticAuthorization(fingerprint, []string{"printer-provider"})
+	hub.OnStateChange(qdef.Identity{Fingerprint: fingerprint, Hostname: "provider-01"}, qdef.StateAuthorized)
 
 	// 4. Test Routing.
 	target := qdef.Addr{
@@ -105,9 +109,15 @@ func TestAnexRouting(t *testing.T) {
 		Machine: fingerprint,
 	}
 
-	// 5. Send message via Hub.Request (which simulated a requester)
+	// 5. Send message via Hub.Request (which simulates a requester)
+	// Use a different identity with requester role.
+	requesterID := qdef.Identity{
+		Hostname:    "requester-01",
+		Fingerprint: "fake-requester-fp",
+		Roles:       []string{"print-requester"},
+	}
 	var resp PrintResp
-	err = hub.Request(ctx, clientID, target, &PrintReq{Content: "hello printer"}, &resp)
+	err = hub.Request(ctx, requesterID, target, &PrintReq{Content: "hello printer"}, &resp)
 	if err != nil {
 		t.Fatalf("Hub.Request failed: %v", err)
 	}
@@ -118,16 +128,25 @@ func TestAnexRouting(t *testing.T) {
 
 func TestProvisionedUnprovisioned(t *testing.T) {
 	ctx := context.Background()
-	id := qdef.Identity{}
 
 	hub := NewHub(0)
+
+	// Set up admin role that can call list-machines and provision.
+	hub.SetRoleDef("admin", RoleConfig{
+		SendsTo: []string{"list-machines", "provision"},
+	})
+	adminID := qdef.Identity{
+		Hostname:    "admin",
+		Fingerprint: "admin-fp",
+		Roles:       []string{"admin"},
+	}
 
 	// Add unprovisioned
 	hub.unprovisioned.Store("machine-alpha", struct{}{})
 	hub.unprovisioned.Store("machine-beta", struct{}{})
 
 	// List with unprovisioned
-	resp, err := hub.handleListMachines(ctx, id, &qdef.ListMachinesReq{ShowUnprovisioned: true})
+	resp, err := hub.handleListMachines(ctx, adminID, &qdef.ListMachinesReq{ShowUnprovisioned: true})
 	if err != nil {
 		t.Fatalf("list machines: %v", err)
 	}
@@ -142,13 +161,13 @@ func TestProvisionedUnprovisioned(t *testing.T) {
 
 	// Provision one
 	provReq := &qdef.ProvisionReq{Fingerprint: []string{"machine-alpha"}}
-	_, err = hub.handleProvision(ctx, id, provReq)
+	_, err = hub.handleProvision(ctx, adminID, provReq)
 	if err != nil {
 		t.Fatalf("provision: %v", err)
 	}
 
 	// Check lists - without unprovisioned flag should show nothing (no connected hosts)
-	resp2, err := hub.handleListMachines(ctx, id, &qdef.ListMachinesReq{ShowUnprovisioned: false})
+	resp2, err := hub.handleListMachines(ctx, adminID, &qdef.ListMachinesReq{ShowUnprovisioned: false})
 	if err != nil {
 		t.Fatalf("list machines: %v", err)
 	}
@@ -157,7 +176,7 @@ func TestProvisionedUnprovisioned(t *testing.T) {
 	}
 
 	// With unprovisioned flag should show only machine-beta now
-	resp3, err := hub.handleListMachines(ctx, id, &qdef.ListMachinesReq{ShowUnprovisioned: true})
+	resp3, err := hub.handleListMachines(ctx, adminID, &qdef.ListMachinesReq{ShowUnprovisioned: true})
 	if err != nil {
 		t.Fatalf("list machines: %v", err)
 	}

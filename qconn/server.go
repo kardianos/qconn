@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io"
 	"net"
 	"time"
 
@@ -307,7 +308,13 @@ func (s *Server) acceptLoop(ctx context.Context, listener *quic.Listener) {
 	}
 }
 
-func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn) error {
+func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.logf(serverIdentity, "panic in handleConnection: %v", r)
+			err = fmt.Errorf("internal server error")
+		}
+	}()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -415,9 +422,19 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn) error {
 }
 
 func (s *Server) handleStream(ctx context.Context, id qdef.Identity, conn *quic.Conn, stream qdef.Stream, provisioningCert bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.logf(id, "panic in handleStream: %v", r)
+			_ = stream.Close()
+		}
+	}()
+
 	dec := cbor.NewDecoder(stream)
 	var msg qdef.Message
 	if err := dec.Decode(&msg); err != nil {
+		if err != io.EOF {
+			s.logf(id, "failed to decode message: %v", err)
+		}
 		h := s.handler
 		if h != nil {
 			h.Handle(ctx, id, qdef.Message{}, stream)

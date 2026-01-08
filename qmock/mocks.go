@@ -122,13 +122,24 @@ func (m *InMemoryAuthorizationManager) SignRenewalCSR(csrPEM []byte, fingerprint
 		return nil, qdef.ErrClientRevoked
 	}
 
-	certPEM, err := qdef.SignCSR(m.CA.caCert, m.CA.caKey, csrPEM, false)
+	// We don't have the hostname here easily, so we first decode the CSR to get it.
+	// In a real implementation, you'd look up the hostname by fingerprint.
+	block, _ := pem.Decode(csrPEM)
+	if block == nil {
+		return nil, fmt.Errorf("failed to decode CSR")
+	}
+	csr, err := x509.ParseCertificateRequest(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse CSR: %w", err)
+	}
+
+	certPEM, err := qdef.SignCSRWithValidation(m.CA.caCert, m.CA.caKey, csrPEM, csr.Subject.CommonName, false)
 	if err != nil {
 		return nil, err
 	}
 
 	// Track the renewed client by new fingerprint.
-	block, _ := pem.Decode(certPEM)
+	block, _ = pem.Decode(certPEM)
 	if block != nil {
 		leaf, _ := x509.ParseCertificate(block.Bytes)
 		if leaf != nil {

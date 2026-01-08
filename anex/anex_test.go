@@ -142,8 +142,8 @@ func TestProvisionedUnprovisioned(t *testing.T) {
 	}
 
 	// Add unprovisioned
-	hub.unprovisioned.Store("machine-alpha", struct{}{})
-	hub.unprovisioned.Store("machine-beta", struct{}{})
+	hub.unprovisioned["machine-alpha"] = struct{}{}
+	hub.unprovisioned["machine-beta"] = struct{}{}
 
 	// List with unprovisioned
 	resp, err := hub.handleListMachines(ctx, adminID, &qdef.ListMachinesReq{ShowUnprovisioned: true})

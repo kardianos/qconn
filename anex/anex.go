@@ -20,13 +20,13 @@ type RoleConfig struct {
 // Hub manages the routing of messages between clients and tracks network state.
 type Hub struct {
 	mu          sync.RWMutex
-	activeConns sync.Map // Map of fingerprint -> *quic.Conn.
-	hostStates  sync.Map // Map of fingerprint -> *qdef.Identity
+	activeConns map[string]*quic.Conn     // Map of fingerprint -> *quic.Conn.
+	hostStates  map[string]*qdef.Identity // Map of fingerprint -> *qdef.Identity
 	defaultWait time.Duration
 
 	roleDefs             map[string]RoleConfig
 	staticAuthorizations map[string][]string // fingerprint -> allowed roles
-	unprovisioned        sync.Map            // hostname -> struct{}
+	unprovisioned        map[string]struct{} // hostname -> struct{}
 }
 
 func NewHub(defaultWait time.Duration) *Hub {
@@ -35,8 +35,11 @@ func NewHub(defaultWait time.Duration) *Hub {
 	}
 	h := &Hub{
 		defaultWait:          defaultWait,
+		activeConns:          make(map[string]*quic.Conn),
+		hostStates:           make(map[string]*qdef.Identity),
 		roleDefs:             make(map[string]RoleConfig),
 		staticAuthorizations: make(map[string][]string),
+		unprovisioned:        make(map[string]struct{}),
 	}
 
 	return h
@@ -57,8 +60,10 @@ func (h *Hub) SetStaticAuthorization(fingerprint string, roles []string) {
 }
 
 func (h *Hub) getIdentity(fingerprint string) qdef.Identity {
-	if val, ok := h.hostStates.Load(fingerprint); ok {
-		return *val.(*qdef.Identity)
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if val, ok := h.hostStates[fingerprint]; ok {
+		return *val
 	}
 	return qdef.Identity{Fingerprint: fingerprint}
 }
@@ -128,12 +133,17 @@ func (h *Hub) RegisterHandlers(r *qdef.StreamRouter) {
 
 // OnIdentityConnect implements qconn.StateListener.
 func (h *Hub) OnIdentityConnect(id qdef.Identity, conn *quic.Conn) {
-	h.activeConns.Store(id.Fingerprint, conn)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.activeConns[id.Fingerprint] = conn
+	delete(h.unprovisioned, id.Hostname)
 }
 
 // OnIdentityDisconnect implements qconn.StateListener.
 func (h *Hub) OnIdentityDisconnect(id qdef.Identity) {
-	h.activeConns.Delete(id.Fingerprint)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.activeConns, id.Fingerprint)
 }
 
 // OnConnect implements qconn.StreamHandler.
@@ -142,55 +152,63 @@ func (h *Hub) OnConnect(conn *quic.Conn) {
 
 // OnStateChange implements qconn.StateListener.
 func (h *Hub) OnStateChange(id qdef.Identity, state qdef.ClientState) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if state == qdef.StateProvisioning {
+		h.unprovisioned[id.Hostname] = struct{}{}
+		return
+	}
+
 	if state == qdef.StateConnected || state == qdef.StateAuthorized {
 		// Assign roles from server-side authorization (not from certificate).
-		h.mu.RLock()
 		roles, ok := h.staticAuthorizations[id.Fingerprint]
-		h.mu.RUnlock()
 		if ok {
 			id.Roles = roles
 		}
-		h.hostStates.Store(id.Fingerprint, &id)
+		h.hostStates[id.Fingerprint] = &id
+		delete(h.unprovisioned, id.Hostname)
 	}
 }
 
 // GetConnectionByMachine returns the active connection for a given machine fingerprint.
 func (h *Hub) GetConnectionByMachine(fingerprint string) (*quic.Conn, error) {
-	val, ok := h.activeConns.Load(fingerprint)
+	h.mu.RLock()
+	val, ok := h.activeConns[fingerprint]
+	h.mu.RUnlock()
 	if !ok {
 		id := h.getIdentity(fingerprint)
 		return nil, fmt.Errorf("%w: machine %s not connected", qdef.ErrTargetNotFound, id)
 	}
-	return val.(*quic.Conn), nil
+	return val, nil
 }
 
 // ListHostStates returns the current state of all known hosts.
 func (h *Hub) ListHostStates(includeUnprovisioned bool) []qdef.HostState {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
 	var states []qdef.HostState
 
 	// Add provisioned hosts.
-	h.hostStates.Range(func(key, value interface{}) bool {
-		id := value.(*qdef.Identity)
-		_, online := h.activeConns.Load(id.Fingerprint)
+	for _, id := range h.hostStates {
+		_, online := h.activeConns[id.Fingerprint]
 		states = append(states, qdef.HostState{
 			Identity:    *id,
 			Online:      online,
 			Provisioned: true,
 		})
-		return true
-	})
+	}
 
 	// Add unprovisioned hosts if requested.
 	if includeUnprovisioned {
-		h.unprovisioned.Range(func(key, value any) bool {
-			hostname := key.(string)
+		for hostname := range h.unprovisioned {
 			states = append(states, qdef.HostState{
 				Identity:    qdef.Identity{Hostname: hostname},
 				Online:      false,
 				Provisioned: false,
 			})
-			return true
-		})
+		}
 	}
 
 	return states
@@ -320,15 +338,25 @@ func (h *Hub) Handle(ctx context.Context, id qdef.Identity, msg qdef.Message, st
 }
 
 func (h *Hub) getReceiverRoles(fingerprint string) []string {
-	if val, ok := h.hostStates.Load(fingerprint); ok {
-		return val.(*qdef.Identity).Roles
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if val, ok := h.hostStates[fingerprint]; ok {
+		return val.Roles
 	}
 	return nil
 }
 
 func (h *Hub) handleDeviceUpdate(ctx context.Context, id qdef.Identity, req *qdef.DeviceUpdateRequest) (*struct{}, error) {
 	// Preserve existing roles from our stored state.
-	existingID := h.getIdentity(id.Fingerprint)
+	h.mu.Lock()
+	existingIDptr, ok := h.hostStates[id.Fingerprint]
+	var existingID qdef.Identity
+	if ok {
+		existingID = *existingIDptr
+	} else {
+		existingID = qdef.Identity{Fingerprint: id.Fingerprint}
+	}
+
 	existingID.Type = req.Type
 	existingID.Devices = req.Devices
 	if existingID.Hostname == "" {
@@ -338,7 +366,9 @@ func (h *Hub) handleDeviceUpdate(ctx context.Context, id qdef.Identity, req *qde
 		existingID.Address = id.Address
 	}
 
-	h.hostStates.Store(id.Fingerprint, &existingID)
+	h.hostStates[id.Fingerprint] = &existingID
+	delete(h.unprovisioned, id.Hostname)
+	h.mu.Unlock()
 
 	return &struct{}{}, nil
 }
@@ -367,11 +397,12 @@ func (h *Hub) handleProvision(ctx context.Context, id qdef.Identity, req *qdef.P
 	if !h.canSend(senderID.Roles, "provision") {
 		return nil, fmt.Errorf("%w: role %v not authorized for provision", qdef.ErrUnauthorized, senderID.Roles)
 	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	for _, fp := range req.Fingerprint {
-		h.unprovisioned.Delete(fp)
-		h.mu.Lock()
+		delete(h.unprovisioned, fp) // Note: fingerpint often matches hostname in this context if not yet provisioned.
 		h.staticAuthorizations[fp] = nil
-		h.mu.Unlock()
 	}
 	return &struct{}{}, nil
 }

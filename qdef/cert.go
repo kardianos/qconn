@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -35,17 +36,71 @@ func randomSerialNumber() (*big.Int, error) {
 	return new(big.Int).SetBytes(serialBytes), nil
 }
 
-// Fingerprint returns the SHA-256 hash of the provided data.
-func Fingerprint(data []byte) [32]byte {
-	return sha256.Sum256(data)
+// FP is a certificate fingerprint (SHA-256 hash of the certificate's raw bytes).
+type FP [32]byte
+
+// String returns the hex-encoded fingerprint.
+func (f FP) String() string {
+	return hex.EncodeToString(f[:])
+}
+
+// IsZero returns true if the fingerprint is all zeros (unset).
+func (f FP) IsZero() bool {
+	return f == FP{}
+}
+
+// MarshalBinary implements encoding.BinaryMarshaler for efficient CBOR encoding.
+func (f FP) MarshalBinary() ([]byte, error) {
+	return f[:], nil
+}
+
+// UnmarshalBinary implements encoding.BinaryUnmarshaler for CBOR decoding.
+func (f *FP) UnmarshalBinary(data []byte) error {
+	if len(data) != 32 {
+		return FingerprintSizeError{Got: len(data)}
+	}
+	copy(f[:], data)
+	return nil
+}
+
+// ParseFP parses a hex-encoded fingerprint string.
+func ParseFP(s string) (FP, error) {
+	var fp FP
+	if s == "" {
+		return fp, nil
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return fp, fmt.Errorf("qconn: invalid fingerprint hex: %w", err)
+	}
+	if len(b) != 32 {
+		return fp, FingerprintSizeError{Got: len(b)}
+	}
+	copy(fp[:], b)
+	return fp, nil
+}
+
+// MustParseFP parses a hex-encoded fingerprint string, panicking on error.
+func MustParseFP(s string) FP {
+	fp, err := ParseFP(s)
+	if err != nil {
+		panic(err)
+	}
+	return fp
+}
+
+// FingerprintOf returns the SHA-256 fingerprint of a certificate.
+func FingerprintOf(cert *x509.Certificate) FP {
+	if cert == nil {
+		return FP{}
+	}
+	return sha256.Sum256(cert.Raw)
 }
 
 // FingerprintHex returns the SHA-256 hash of the certificate's raw bytes as a hex string.
+// Deprecated: Use FingerprintOf(cert).String() instead.
 func FingerprintHex(cert *x509.Certificate) string {
-	if cert == nil {
-		return ""
-	}
-	return fmt.Sprintf("%x", Fingerprint(cert.Raw))
+	return FingerprintOf(cert).String()
 }
 
 // EncodeCertPEM converts an x509 certificate to PEM format.
@@ -269,27 +324,27 @@ func SignCSR(caCert *x509.Certificate, caKey *ecdsa.PrivateKey, csrPEM []byte, i
 func SignCSRWithValidation(caCert *x509.Certificate, caKey *ecdsa.PrivateKey, csrPEM []byte, expectedHostname string, isServer bool) (certPEM []byte, err error) {
 	block, _ := pem.Decode(csrPEM)
 	if block == nil || block.Type != "CERTIFICATE REQUEST" {
-		return nil, fmt.Errorf("failed to decode CSR PEM")
+		return nil, ErrDecodeCSR
 	}
 
 	csr, err := x509.ParseCertificateRequest(block.Bytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse CSR: %w", err)
+		return nil, fmt.Errorf("qconn: failed to parse CSR: %w", err)
 	}
 
 	if err := csr.CheckSignature(); err != nil {
-		return nil, fmt.Errorf("CSR signature invalid: %w", err)
+		return nil, fmt.Errorf("qconn: CSR signature invalid: %w", err)
 	}
 
 	// Validate that CSR matches expected hostname to prevent identity spoofing.
 	if expectedHostname != "" {
 		if csr.Subject.CommonName != expectedHostname {
-			return nil, fmt.Errorf("CSR CommonName %q does not match expected hostname %q", csr.Subject.CommonName, expectedHostname)
+			return nil, CSRHostnameMismatchError{Got: csr.Subject.CommonName, Expected: expectedHostname}
 		}
 		// Validate DNSNames only contain the expected hostname.
 		for _, dns := range csr.DNSNames {
 			if dns != expectedHostname {
-				return nil, fmt.Errorf("CSR contains unauthorized DNS name %q (expected %q)", dns, expectedHostname)
+				return nil, CSRUnauthorizedDNSError{Got: dns, Expected: expectedHostname}
 			}
 		}
 	}

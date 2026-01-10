@@ -67,8 +67,8 @@ type Client struct {
 
 type ClientOpt struct {
 	ServerHostname  string
-	CredentialStore CredentialStore
-	Resolver        Resolver
+	CredentialStore qdef.CredentialStore
+	Resolver        qdef.Resolver
 	Handler         qdef.StreamHandler
 	ResolverRefresh time.Duration
 	Observer        qdef.ClientObserver
@@ -106,7 +106,7 @@ func (c *Client) logf(format string, v ...interface{}) {
 }
 
 // SetResolver sets the resolver for the client.
-func (c *Client) SetResolver(r Resolver) {
+func (c *Client) SetResolver(r qdef.Resolver) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.opt.Resolver = r
@@ -411,11 +411,11 @@ func (c *Client) supervisor(ctx context.Context) {
 
 		// 2. We have a valid config, try to connect.
 		if tlsConfig != nil {
-			if c.identity.Fingerprint == "" && len(tlsConfig.Certificates) > 0 {
+			if c.identity.Fingerprint.IsZero() && len(tlsConfig.Certificates) > 0 {
 				leaf, err := x509.ParseCertificate(tlsConfig.Certificates[0].Certificate[0])
 				if err == nil {
 					c.identity.Hostname = leaf.Subject.CommonName
-					c.identity.Fingerprint = qdef.FingerprintHex(leaf)
+					c.identity.Fingerprint = qdef.FingerprintOf(leaf)
 				}
 			}
 			c.attemptConnect(ctx, tlsConfig)

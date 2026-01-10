@@ -66,7 +66,7 @@ type Client struct {
 }
 
 // NewClient initializes a client that handles provisioning and persistent storage.
-func NewClient(serverAddr string, store qconn.CredentialStore) *Client {
+func NewClient(serverAddr string, store qdef.CredentialStore) *Client {
 	c := &Client{
 		providers: make(map[string]DeviceProvider),
 	}
@@ -75,7 +75,7 @@ func NewClient(serverAddr string, store qconn.CredentialStore) *Client {
 		ServerHostname:  serverAddr,
 		CredentialStore: store,
 		Handler:         c, // Client implements qconn.StreamHandler
-		Resolver:        qconn.NetResolver{},
+		Resolver:        qdef.NetResolver{},
 	}
 	c.qcClient = qconn.NewClient(opts)
 
@@ -83,7 +83,7 @@ func NewClient(serverAddr string, store qconn.CredentialStore) *Client {
 }
 
 // SetResolver sets a custom resolver for the internal qconn client.
-func (c *Client) SetResolver(r qconn.Resolver) {
+func (c *Client) SetResolver(r qdef.Resolver) {
 	c.qcClient.SetResolver(r)
 }
 

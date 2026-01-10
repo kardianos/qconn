@@ -6,6 +6,9 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
+	"net"
+	"net/netip"
+	"time"
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/quic-go/quic-go"
@@ -42,7 +45,139 @@ var (
 
 	// ErrTargetNotFound is returned when the target machine is not connected.
 	ErrTargetNotFound = fmt.Errorf("qconn: target not found")
+
+	// ErrDecodeCSR is returned when a CSR PEM block cannot be decoded.
+	ErrDecodeCSR = fmt.Errorf("qconn: failed to decode CSR PEM")
+
+	// ErrDecodeCert is returned when a certificate PEM block cannot be decoded.
+	ErrDecodeCert = fmt.Errorf("qconn: failed to decode certificate PEM")
+
+	// ErrRootCANotFound is returned when the root CA certificate is not available.
+	ErrRootCANotFound = fmt.Errorf("qconn: root CA not found")
+
+	// ErrNoClientCert is returned when a TLS connection has no client certificate.
+	ErrNoClientCert = fmt.Errorf("qconn: no client certificate")
+
+	// ErrNoPeerCert is returned when a connection has no peer certificates.
+	ErrNoPeerCert = fmt.Errorf("qconn: no peer certificates")
+
+	// ErrAuthRequired is returned when server requires an authorization manager.
+	ErrAuthRequired = fmt.Errorf("qconn: auth is required")
+
+	// ErrInvalidAddress is returned when a client address is invalid for rate limiting.
+	ErrInvalidAddress = fmt.Errorf("qconn: invalid client address")
+
+	// ErrFingerprintEmpty is returned when an operation requires a fingerprint but none is provided.
+	ErrFingerprintEmpty = fmt.Errorf("qconn: fingerprint is empty")
 )
+
+// FingerprintSizeError is returned when a fingerprint has an invalid byte length.
+type FingerprintSizeError struct {
+	Got int
+}
+
+func (e FingerprintSizeError) Error() string {
+	return fmt.Sprintf("qconn: fingerprint must be 32 bytes, got %d", e.Got)
+}
+
+// CSRHostnameMismatchError is returned when a CSR's CommonName doesn't match the expected hostname.
+type CSRHostnameMismatchError struct {
+	Got      string
+	Expected string
+}
+
+func (e CSRHostnameMismatchError) Error() string {
+	return fmt.Sprintf("qconn: CSR CommonName %q does not match expected hostname %q", e.Got, e.Expected)
+}
+
+// CSRUnauthorizedDNSError is returned when a CSR contains a DNS name that doesn't match the expected hostname.
+type CSRUnauthorizedDNSError struct {
+	Got      string
+	Expected string
+}
+
+func (e CSRUnauthorizedDNSError) Error() string {
+	return fmt.Sprintf("qconn: CSR contains unauthorized DNS name %q (expected %q)", e.Got, e.Expected)
+}
+
+// ClientRevokedError is returned when operations are attempted on a revoked client.
+type ClientRevokedError struct {
+	Hostname    string
+	Fingerprint FP
+}
+
+func (e ClientRevokedError) Error() string {
+	return fmt.Sprintf("qconn: client %s [%s] is revoked", e.Hostname, e.Fingerprint)
+}
+
+// RateLimitError is returned when an operation is rate limited.
+type RateLimitError struct {
+	Operation string
+	Target    string
+	Wait      time.Duration
+}
+
+func (e RateLimitError) Error() string {
+	return fmt.Sprintf("%s: %s for %s: wait %v", ErrRateLimited, e.Operation, e.Target, e.Wait)
+}
+
+func (e RateLimitError) Unwrap() error {
+	return ErrRateLimited
+}
+
+// UnauthorizedRoleError is returned when a role lacks permission for an operation.
+type UnauthorizedRoleError struct {
+	Roles   []string
+	JobType string
+}
+
+func (e UnauthorizedRoleError) Error() string {
+	return fmt.Sprintf("%s: role %v not authorized to send job type %q", ErrUnauthorized, e.Roles, e.JobType)
+}
+
+func (e UnauthorizedRoleError) Unwrap() error {
+	return ErrUnauthorized
+}
+
+// UnauthorizedTargetError is returned when a target lacks permission to provide a job type.
+type UnauthorizedTargetError struct {
+	Target  string
+	JobType string
+}
+
+func (e UnauthorizedTargetError) Error() string {
+	return fmt.Sprintf("%s: target %q not authorized to provide job type %q", ErrUnauthorized, e.Target, e.JobType)
+}
+
+func (e UnauthorizedTargetError) Unwrap() error {
+	return ErrUnauthorized
+}
+
+// TargetUnavailableError is returned when a target machine is not available after a timeout.
+type TargetUnavailableError struct {
+	Target Addr
+}
+
+func (e TargetUnavailableError) Error() string {
+	return fmt.Sprintf("%s: target %v not available after timeout", ErrTargetNotFound, e.Target)
+}
+
+func (e TargetUnavailableError) Unwrap() error {
+	return ErrTargetNotFound
+}
+
+// MachineNotConnectedError is returned when a target machine is not connected.
+type MachineNotConnectedError struct {
+	Identity Identity
+}
+
+func (e MachineNotConnectedError) Error() string {
+	return fmt.Sprintf("%s: machine %s not connected", ErrTargetNotFound, e.Identity)
+}
+
+func (e MachineNotConnectedError) Unwrap() error {
+	return ErrTargetNotFound
+}
 
 // ClientStatus represents the authorization state of a client.
 type ClientStatus int
@@ -142,16 +277,27 @@ func (s ServerConnState) String() string {
 
 // Identity represents a host's persistent identity.
 type Identity struct {
-	Hostname    string   `json:"hostname"`
-	Address     string   `json:"address"`
-	Fingerprint string   `json:"fingerprint"`
-	Type        string   `json:"type"`
-	Roles       []string `json:"roles"`
-	Devices     []string `json:"devices"`
+	// Fingerprint is the SHA-256 hash of the client's certificate.
+	Fingerprint FP `cbor:"1,keyasint"`
+
+	// Hostname is the client's declared hostname from provisioning.
+	Hostname string `cbor:"2,keyasint"`
+
+	// Address is the client's last known connection address.
+	Address netip.AddrPort `cbor:"3,keyasint"`
+
+	// Type is an optional machine type classification.
+	Type string `cbor:"4,keyasint,omitempty"`
+
+	// Roles are the authorization roles assigned to this client (server-side only).
+	Roles []string `cbor:"5,keyasint,omitempty"`
+
+	// Devices are the device types this client provides.
+	Devices []string `cbor:"6,keyasint,omitempty"`
 }
 
 func (id Identity) String() string {
-	if id.Fingerprint == "" && id.Hostname == "" && id.Address == "" {
+	if id.Fingerprint.IsZero() && id.Hostname == "" && !id.Address.IsValid() {
 		return "unknown"
 	}
 	return fmt.Sprintf("%s (%s, %s)", id.Fingerprint, id.Hostname, id.Address)
@@ -266,6 +412,7 @@ type Stream interface {
 
 // GetStatusFromCert is a helper for auth managers (may be moved to an internal package later if needed).
 // AuthorizationManager handles client authorization, role assignment, and certificate issuance.
+// For Server.
 type AuthorizationManager interface {
 	// GetStatus returns the current authorization status of a client certificate.
 	GetStatus(cert *x509.Certificate) (ClientStatus, error)
@@ -316,4 +463,32 @@ type RenewalRequest struct {
 type DeviceUpdateRequest struct {
 	Type    string   `cbor:"type"`
 	Devices []string `cbor:"devices"`
+}
+
+// CredentialStore handles the persistence of client credentials.
+// For Client.
+type CredentialStore interface {
+	GetIdentity() (Identity, error)
+	GetClientCertificate() (tls.Certificate, error)
+	GetRootCAs() (*x509.CertPool, error)
+	SaveCredentials(id Identity, certPEM, keyPEM []byte) error
+	ProvisionToken() string
+	OnUpdate() <-chan struct{}
+}
+
+// Resolver handles hostname to address resolution.
+type Resolver interface {
+	Resolve(ctx context.Context, hostname string) (net.Addr, error)
+	OnUpdate(hostname string) <-chan struct{}
+}
+
+// NetResolver is a default implementation of Resolver using standard net package.
+type NetResolver struct{}
+
+func (r NetResolver) Resolve(ctx context.Context, hostname string) (net.Addr, error) {
+	return net.ResolveUDPAddr("udp", hostname)
+}
+
+func (r NetResolver) OnUpdate(hostname string) <-chan struct{} {
+	return nil
 }

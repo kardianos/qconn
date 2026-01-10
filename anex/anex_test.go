@@ -78,7 +78,7 @@ func TestAnexRouting(t *testing.T) {
 	}
 
 	// Wait for connection and device registration.
-	fingerprint := ""
+	var fingerprint qdef.FP
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		states := hub.ListHostStates(false)
@@ -88,32 +88,32 @@ func TestAnexRouting(t *testing.T) {
 				break
 			}
 		}
-		if fingerprint != "" {
+		if !fingerprint.IsZero() {
 			break
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	if fingerprint == "" {
+	if fingerprint.IsZero() {
 		t.Fatal("provider client did not register devices in time")
 	}
 
 	// Now that we know the fingerprint, set up role authorization and re-trigger state change.
-	hub.SetStaticAuthorization(fingerprint, []string{"printer-provider"})
+	hub.SetStaticAuthorization(fingerprint.String(), []string{"printer-provider"})
 	hub.OnStateChange(qdef.Identity{Fingerprint: fingerprint, Hostname: "provider-01"}, qdef.StateAuthorized)
 
 	// 4. Test Routing.
 	target := qdef.Addr{
 		Service: qdef.ServiceUser,
 		Type:    "printer",
-		Machine: fingerprint,
+		Machine: fingerprint.String(),
 	}
 
 	// 5. Send message via Hub.Request (which simulates a requester)
 	// Use a different identity with requester role.
 	requesterID := qdef.Identity{
 		Hostname:    "requester-01",
-		Fingerprint: "fake-requester-fp",
+		Fingerprint: qdef.MustParseFP("0000000000000000000000000000000000000000000000000000000000000001"),
 		Roles:       []string{"print-requester"},
 	}
 	var resp PrintResp
@@ -137,7 +137,7 @@ func TestProvisionedUnprovisioned(t *testing.T) {
 	})
 	adminID := qdef.Identity{
 		Hostname:    "admin",
-		Fingerprint: "admin-fp",
+		Fingerprint: qdef.MustParseFP("0000000000000000000000000000000000000000000000000000000000000002"),
 		Roles:       []string{"admin"},
 	}
 

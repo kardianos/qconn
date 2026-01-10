@@ -90,8 +90,7 @@ func TestRoleBasedRouting(t *testing.T) {
 	defer managerClient.Close()
 
 	// Wait for connection and appear online in hub.
-	var workerFingerprint string
-	var managerFingerprint string
+	var workerFingerprint, managerFingerprint qdef.FP
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		states := hub.ListHostStates(false)
@@ -103,20 +102,20 @@ func TestRoleBasedRouting(t *testing.T) {
 				managerFingerprint = s.Identity.Fingerprint
 			}
 		}
-		if workerFingerprint != "" && managerFingerprint != "" {
+		if !workerFingerprint.IsZero() && !managerFingerprint.IsZero() {
 			break
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	if workerFingerprint == "" || managerFingerprint == "" {
-		t.Fatalf("clients did not connect in time (worker: %v, manager: %v)", workerFingerprint != "", managerFingerprint != "")
+	if workerFingerprint.IsZero() || managerFingerprint.IsZero() {
+		t.Fatalf("clients did not connect in time (worker: %v, manager: %v)", !workerFingerprint.IsZero(), !managerFingerprint.IsZero())
 	}
 
 	// Now that we know the fingerprints, set up role authorizations.
 	// This also triggers OnStateChange to reassign roles.
-	hub.SetStaticAuthorization(workerFingerprint, []string{"worker"})
-	hub.SetStaticAuthorization(managerFingerprint, []string{"manager"})
+	hub.SetStaticAuthorization(workerFingerprint.String(), []string{"worker"})
+	hub.SetStaticAuthorization(managerFingerprint.String(), []string{"manager"})
 
 	// Re-trigger state change to assign roles.
 	hub.OnStateChange(qdef.Identity{Fingerprint: workerFingerprint, Hostname: "worker-01"}, qdef.StateAuthorized)
@@ -128,7 +127,7 @@ func TestRoleBasedRouting(t *testing.T) {
 	// 3. Test Routing: Manager sends 'compute' to Worker
 	t.Run("AuthorizedCommunication", func(t *testing.T) {
 		target := qdef.Addr{
-			Machine: workerFingerprint,
+			Machine: workerFingerprint.String(),
 			Type:    "compute",
 			Service: qdef.ServiceUser,
 		}
@@ -149,7 +148,7 @@ func TestRoleBasedRouting(t *testing.T) {
 		})
 
 		target := qdef.Addr{
-			Machine: workerFingerprint,
+			Machine: workerFingerprint.String(),
 			Type:    "compute",
 			Service: qdef.ServiceUser,
 		}
@@ -174,7 +173,7 @@ func TestRoleBasedRouting(t *testing.T) {
 		})
 
 		target := qdef.Addr{
-			Machine: workerFingerprint,
+			Machine: workerFingerprint.String(),
 			Type:    "compute",
 			Service: qdef.ServiceUser,
 		}
@@ -183,7 +182,7 @@ func TestRoleBasedRouting(t *testing.T) {
 		_, err := qclient.Request[ComputeReq, ComputeResp](managerClient, ctx, target, &req)
 		if err == nil {
 			t.Error("expected unauthorized error, got nil")
-		} else if err.Error() != "qconn: unauthorized: target \""+workerFingerprint+"\" not authorized to provide job type \"compute\"" {
+		} else if err.Error() != "qconn: unauthorized: target \""+workerFingerprint.String()+"\" not authorized to provide job type \"compute\"" {
 			t.Errorf("unexpected error: %v", err)
 		}
 	})

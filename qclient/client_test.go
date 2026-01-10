@@ -109,7 +109,7 @@ func TestSimpleClientAPI(t *testing.T) {
 	}
 
 	// 4. Wait for both clients to connect and discover their fingerprints.
-	var requesterFP, providerFP string
+	var requesterFP, providerFP qdef.FP
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		states := hub.ListHostStates(false)
@@ -119,22 +119,22 @@ func TestSimpleClientAPI(t *testing.T) {
 			}
 			if s.Identity.Hostname == "provider-01" && s.Online && len(s.Identity.Devices) > 0 {
 				providerFP = s.Identity.Fingerprint
-				providerID = providerFP
+				providerID = providerFP.String()
 			}
 		}
-		if requesterFP != "" && providerFP != "" {
+		if !requesterFP.IsZero() && !providerFP.IsZero() {
 			break
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	if requesterFP == "" || providerFP == "" {
-		t.Fatalf("clients did not connect in time (requester: %v, provider: %v)", requesterFP != "", providerFP != "")
+	if requesterFP.IsZero() || providerFP.IsZero() {
+		t.Fatalf("clients did not connect in time (requester: %v, provider: %v)", !requesterFP.IsZero(), !providerFP.IsZero())
 	}
 
 	// Set up role authorization now that we know the fingerprints.
-	hub.SetStaticAuthorization(requesterFP, []string{"requester"})
-	hub.SetStaticAuthorization(providerFP, []string{"provider"})
+	hub.SetStaticAuthorization(requesterFP.String(), []string{"requester"})
+	hub.SetStaticAuthorization(providerFP.String(), []string{"provider"})
 	hub.OnStateChange(qdef.Identity{Fingerprint: requesterFP, Hostname: "requester-01"}, qdef.StateAuthorized)
 	hub.OnStateChange(qdef.Identity{Fingerprint: providerFP, Hostname: "provider-01"}, qdef.StateAuthorized)
 
@@ -146,7 +146,7 @@ func TestSimpleClientAPI(t *testing.T) {
 			for _, h := range hosts {
 				for _, d := range h.Identity.Devices {
 					if d == "printer" {
-						providerID = h.Identity.Fingerprint
+						providerID = h.Identity.Fingerprint.String()
 						break
 					}
 				}
@@ -216,7 +216,7 @@ func TestDeviceProviders(t *testing.T) {
 	}
 
 	// Set up authorization for this client's fingerprint.
-	hub.SetStaticAuthorization(provID.Fingerprint, []string{"device-provider"})
+	hub.SetStaticAuthorization(provID.Fingerprint.String(), []string{"device-provider"})
 	auth.AuthorizeAll()
 
 	client := NewClient(serverAddr, store)

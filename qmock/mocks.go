@@ -77,13 +77,14 @@ func (m *InMemoryAuthorizationManager) AuthorizeAll() {
 	}
 }
 func (m *InMemoryAuthorizationManager) SetStatus(id qdef.Identity, status qdef.ClientStatus) error {
-	if len(id.Fingerprint) == 0 {
+	if id.Fingerprint.IsZero() {
 		return fmt.Errorf("missing fingerprint")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.clients[id.Fingerprint] = status
-	m.trigger(id.Fingerprint)
+	fpStr := id.Fingerprint.String()
+	m.clients[fpStr] = status
+	m.trigger(fpStr)
 	return nil
 }
 func (m *InMemoryAuthorizationManager) SignProvisioningCSR(csrPEM []byte, hostname string) ([]byte, error) {
@@ -156,13 +157,14 @@ func (m *InMemoryAuthorizationManager) SignRenewalCSR(csrPEM []byte, fingerprint
 	return certPEM, nil
 }
 func (m *InMemoryAuthorizationManager) Revoke(id qdef.Identity) error {
-	if len(id.Fingerprint) == 0 {
+	if id.Fingerprint.IsZero() {
 		return errors.New("fingerprint is empty")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.clients[id.Fingerprint] = qdef.StatusRevoked
-	m.trigger(id.Fingerprint)
+	fpStr := id.Fingerprint.String()
+	m.clients[fpStr] = qdef.StatusRevoked
+	m.trigger(fpStr)
 	return nil
 }
 func (m *InMemoryAuthorizationManager) AuthorizeRoles(fingerprint string, requested []string) []string {
@@ -203,14 +205,15 @@ func (m *InMemoryAuthorizationManager) IssueClientCertificate(id *qdef.Identity)
 	if block != nil {
 		leaf, _ := x509.ParseCertificate(block.Bytes)
 		if leaf != nil {
-			id.Fingerprint = qdef.FingerprintHex(leaf)
+			id.Fingerprint = qdef.FingerprintOf(leaf)
 		}
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.clients[id.Fingerprint] = qdef.StatusUnauthorized
-	m.trigger(id.Fingerprint)
+	fpStr := id.Fingerprint.String()
+	m.clients[fpStr] = qdef.StatusUnauthorized
+	m.trigger(fpStr)
 
 	return certPEM, keyPEM, nil
 }
@@ -293,7 +296,7 @@ func (s *InMemoryCredentialStore) SaveCredentials(id qdef.Identity, certPEM, key
 	if block != nil {
 		leaf, _ := x509.ParseCertificate(block.Bytes)
 		if leaf != nil {
-			id.Fingerprint = qdef.FingerprintHex(leaf)
+			id.Fingerprint = qdef.FingerprintOf(leaf)
 		}
 	}
 

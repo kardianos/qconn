@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
@@ -122,7 +123,7 @@ type ServerOpt struct {
 // NewServer creates a new QUIC server.
 func NewServer(opt ServerOpt) (*Server, error) {
 	if opt.Auth == nil {
-		return nil, fmt.Errorf("qconn: auth is required")
+		return nil, qdef.ErrAuthRequired
 	}
 	cert, err := opt.Auth.ServerCertificate()
 	if err != nil {
@@ -148,7 +149,7 @@ func NewServer(opt ServerOpt) (*Server, error) {
 		ClientAuth:   tls.RequireAnyClientCert,
 		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 			if len(rawCerts) == 0 {
-				return fmt.Errorf("qconn: no client certificate")
+				return qdef.ErrNoClientCert
 			}
 			leaf, err := x509.ParseCertificate(rawCerts[0])
 			if err != nil {
@@ -185,12 +186,12 @@ func NewServer(opt ServerOpt) (*Server, error) {
 			}
 
 			status, err := opt.Auth.GetStatus(leaf)
-			fp := qdef.FingerprintHex(leaf)
+			fp := qdef.FingerprintOf(leaf)
 			if err != nil {
 				return fmt.Errorf("qconn: failed to get auth status for %s [%s]: %w", leaf.Subject.CommonName, fp, err)
 			}
 			if status == qdef.StatusRevoked {
-				return fmt.Errorf("qconn: client %s [%s] is revoked or not found", leaf.Subject.CommonName, fp)
+				return qdef.ClientRevokedError{Hostname: leaf.Subject.CommonName, Fingerprint: fp}
 			}
 			return nil
 		},
@@ -312,7 +313,7 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn) (err err
 	defer func() {
 		if r := recover(); r != nil {
 			s.logf(serverIdentity, "panic in handleConnection: %v", r)
-			err = fmt.Errorf("internal server error")
+			err = fmt.Errorf("internal server error: %v", r)
 		}
 	}()
 	ctx, cancel := context.WithCancel(ctx)
@@ -321,15 +322,15 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn) (err err
 	cs := conn.ConnectionState()
 	pcList := cs.TLS.PeerCertificates
 	if len(pcList) == 0 {
-		return fmt.Errorf("client disconnected: no peer certificates")
+		return qdef.ErrNoPeerCert
 	}
 	leaf := pcList[0]
 
-	remoteAddr := conn.RemoteAddr().String()
+	remoteAddrPort, _ := netip.ParseAddrPort(conn.RemoteAddr().String())
 	id := qdef.Identity{
 		Hostname:    leaf.Subject.CommonName,
-		Address:     remoteAddr,
-		Fingerprint: qdef.FingerprintHex(leaf),
+		Address:     remoteAddrPort,
+		Fingerprint: qdef.FingerprintOf(leaf),
 		// Roles are managed server-side, not extracted from certificate.
 	}
 
@@ -457,12 +458,13 @@ func (s *Server) handleStream(ctx context.Context, id qdef.Identity, conn *quic.
 }
 
 func (s *Server) handleRenewal(ctx context.Context, id qdef.Identity, req *qdef.RenewalRequest) (*qdef.CredentialResponse, error) {
+	fpStr := id.Fingerprint.String()
 	// Rate limit: atomically check and record to prevent race conditions.
-	if allowed, remaining := s.renewalLimiter.allow(id.Fingerprint); !allowed {
-		return nil, fmt.Errorf("%w: renewal for %s: wait %v", qdef.ErrRateLimited, id.Hostname, remaining)
+	if allowed, remaining := s.renewalLimiter.allow(fpStr); !allowed {
+		return nil, qdef.RateLimitError{Operation: "renewal", Target: id.Hostname, Wait: remaining}
 	}
 
-	certPEM, err := s.authManager.SignRenewalCSR(req.CSRPEM, id.Fingerprint)
+	certPEM, err := s.authManager.SignRenewalCSR(req.CSRPEM, fpStr)
 	if err != nil {
 		return nil, err
 	}
@@ -472,18 +474,18 @@ func (s *Server) handleRenewal(ctx context.Context, id qdef.Identity, req *qdef.
 
 func (s *Server) handleProvisioning(ctx context.Context, id qdef.Identity, req *qdef.ProvisioningRequest) (*qdef.CredentialResponse, error) {
 	// Rate limit by IP address (provisioning clients don't have fingerprints yet).
-	clientIP, _, _ := net.SplitHostPort(id.Address)
-	if clientIP == "" {
-		clientIP = id.Address // Fallback if no port in address
+	clientIP := ""
+	if id.Address.IsValid() {
+		clientIP = id.Address.Addr().String()
 	}
 	// Reject requests with empty/invalid addresses to prevent rate limit bypass.
 	if clientIP == "" {
-		return nil, fmt.Errorf("invalid client address for rate limiting")
+		return nil, qdef.ErrInvalidAddress
 	}
 
 	// Atomically check and record to prevent race conditions.
 	if allowed, remaining := s.provisioningLimiter.allow(clientIP); !allowed {
-		return nil, fmt.Errorf("%w: provisioning from %s: wait %v", qdef.ErrRateLimited, clientIP, remaining)
+		return nil, qdef.RateLimitError{Operation: "provisioning", Target: clientIP, Wait: remaining}
 	}
 
 	provId := qdef.Identity{Hostname: req.Hostname}

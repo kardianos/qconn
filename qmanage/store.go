@@ -28,8 +28,9 @@ type ClientStore interface {
 
 // RoleConfig defines what a role can do.
 type RoleConfig struct {
-	Provides []string `cbor:"1,keyasint"` // Job types this role provides.
-	SendsTo  []string `cbor:"2,keyasint"` // Job types this role can send to.
+	Provides       []string `cbor:"1,keyasint"` // Job types this role provides.
+	SendsTo        []string `cbor:"2,keyasint"` // Job types this role can send to.
+	MaxPayloadSize int      `cbor:"3,keyasint"` // Max payload size in bytes for Provides types (0 = use default).
 }
 
 // ClientRecord stores information about a provisioned client.

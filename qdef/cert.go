@@ -184,6 +184,22 @@ func CreateCert(caCert *x509.Certificate, caKey *ecdsa.PrivateKey, hostname stri
 }
 
 // GenerateDerivedCA creates a deterministic CA certificate and key based on a shared secret.
+//
+// SECURITY: The provision token (sharedSecret) grants the ability to initiate provisioning
+// with the server. Token management best practices:
+//
+//   - Rotation: Tokens should be rotated after initial deployment of all expected clients,
+//     or periodically (e.g., every 90 days) for environments with ongoing provisioning.
+//
+//   - Revocation: Remove compromised tokens from ServerOpt.ProvisionTokens immediately.
+//     Clients provisioned with old tokens remain valid; only new provisioning is affected.
+//
+//   - Scope: Use different tokens for different trust boundaries (e.g., production vs staging).
+//
+//   - Storage: Tokens should be stored securely (environment variables, secrets manager)
+//     and never committed to source control.
+//
+//   - Logging: Token values should never be logged. Log token identifiers if needed.
 func GenerateDerivedCA(sharedSecret string) (tls.Certificate, error) {
 	seed := sha256.Sum256([]byte(sharedSecret))
 

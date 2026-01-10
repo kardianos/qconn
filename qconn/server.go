@@ -4,13 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
 	"time"
 
-	"github.com/fxamacker/cbor/v2"
 	"github.com/kardianos/qconn/qdef"
 	"github.com/kardianos/qconn/qstate"
 	"github.com/quic-go/quic-go"
@@ -62,18 +62,20 @@ func serverConnStateToClientState(s qdef.ServerConnState) qdef.ClientState {
 
 // Server implements the QUIC server logic.
 type Server struct {
-	addr                string
-	tlsConfig           *tls.Config
-	authManager         qdef.AuthorizationManager
-	provisioningPool    *x509.CertPool
-	handler             qdef.StreamHandler
-	observer            qdef.ClientObserver
-	listener            qdef.StateListener
-	keepAlivePeriod     time.Duration
-	renewalLimiter      *rateLimiter
-	provisioningLimiter *rateLimiter
-	Router              qdef.StreamRouter
-	cancel              context.CancelFunc // Cancels background goroutines like rate limiter cleanup
+	addr                       string
+	tlsConfig                  *tls.Config
+	authManager                qdef.AuthorizationManager
+	provisioningPool           *x509.CertPool
+	handler                    qdef.StreamHandler
+	observer                   qdef.ClientObserver
+	listener                   qdef.StateListener
+	keepAlivePeriod            time.Duration
+	renewalLimiter             *rateLimiter
+	provisioningLimiter        *rateLimiter
+	maxMessageSize             int
+	provisioningMaxMessageSize int
+	Router                     qdef.StreamRouter
+	cancel                     context.CancelFunc // Cancels background goroutines like rate limiter cleanup
 }
 
 const (
@@ -91,7 +93,11 @@ type ServerOpt struct {
 	ListenOn string
 
 	// ProvisionTokens is a list of shared secrets used to authorize new clients
-	// during the provisioning phase.
+	// during the provisioning phase. Multiple tokens allow for rotation without
+	// disrupting in-progress provisioning.
+	//
+	// SECURITY: See qdef.GenerateDerivedCA for token management best practices
+	// including rotation, revocation, and storage guidelines.
 	ProvisionTokens []string
 
 	// Auth is the AuthorizationManager responsible for verifying client identities,
@@ -118,6 +124,15 @@ type ServerOpt struct {
 	// ProvisioningInterval is the minimum time between provisioning attempts from the same IP.
 	// If zero, defaults to DefaultProvisioningInterval.
 	ProvisioningInterval time.Duration
+
+	// MaxMessageSize is the maximum size for CBOR messages from authorized clients.
+	// If zero, defaults to qdef.DefaultMaxMessageSize (1MB).
+	MaxMessageSize int
+
+	// ProvisioningMaxMessageSize is the maximum size for CBOR messages from provisioning clients.
+	// If zero, defaults to qdef.ProvisioningMaxMessageSize (64KB).
+	// This should be kept small since provisioning only needs CSR and hostname.
+	ProvisioningMaxMessageSize int
 }
 
 // NewServer creates a new QUIC server.
@@ -210,18 +225,29 @@ func NewServer(opt ServerOpt) (*Server, error) {
 	// Create a context for background goroutines (rate limiter cleanup).
 	bgCtx, cancel := context.WithCancel(context.Background())
 
+	maxMsgSize := opt.MaxMessageSize
+	if maxMsgSize <= 0 {
+		maxMsgSize = qdef.DefaultMaxMessageSize
+	}
+	provMaxMsgSize := opt.ProvisioningMaxMessageSize
+	if provMaxMsgSize <= 0 {
+		provMaxMsgSize = qdef.ProvisioningMaxMessageSize
+	}
+
 	s := &Server{
-		addr:                opt.ListenOn,
-		tlsConfig:           tlsConfig,
-		authManager:         opt.Auth,
-		provisioningPool:    provisioningPool,
-		handler:             opt.Handler,
-		observer:            opt.Observer,
-		listener:            opt.Listener,
-		keepAlivePeriod:     opt.KeepAlivePeriod,
-		renewalLimiter:      newRateLimiter(bgCtx, renewalInterval),
-		provisioningLimiter: newRateLimiter(bgCtx, provisioningInterval),
-		cancel:              cancel,
+		addr:                       opt.ListenOn,
+		tlsConfig:                  tlsConfig,
+		authManager:                opt.Auth,
+		provisioningPool:           provisioningPool,
+		handler:                    opt.Handler,
+		observer:                   opt.Observer,
+		listener:                   opt.Listener,
+		keepAlivePeriod:            opt.KeepAlivePeriod,
+		renewalLimiter:             newRateLimiter(bgCtx, renewalInterval),
+		provisioningLimiter:        newRateLimiter(bgCtx, provisioningInterval),
+		maxMessageSize:             maxMsgSize,
+		provisioningMaxMessageSize: provMaxMsgSize,
+		cancel:                     cancel,
 	}
 
 	qdef.Handle(&s.Router, qdef.ServiceProvision, "", s.handleProvisioning)
@@ -416,6 +442,10 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn) (err err
 		}
 		stream, err := conn.AcceptStream(ctx)
 		if err != nil {
+			// Log unless it's a clean shutdown (context cancelled or connection closed).
+			if ctx.Err() == nil && conn.Context().Err() == nil {
+				s.logf(id, "failed to accept stream: %v", err)
+			}
 			return nil
 		}
 		go s.handleStream(ctx, id, conn, stream, isProvisioning)
@@ -430,7 +460,13 @@ func (s *Server) handleStream(ctx context.Context, id qdef.Identity, conn *quic.
 		}
 	}()
 
-	dec := cbor.NewDecoder(stream)
+	// Use strict size limits for provisioning clients to prevent abuse.
+	maxSize := s.maxMessageSize
+	if provisioningCert {
+		maxSize = s.provisioningMaxMessageSize
+	}
+	dec := qdef.NewDecoder(stream, maxSize)
+
 	var msg qdef.Message
 	if err := dec.Decode(&msg); err != nil {
 		if err != io.EOF {
@@ -447,14 +483,22 @@ func (s *Server) handleStream(ctx context.Context, id qdef.Identity, conn *quic.
 		msg.Target.Service = qdef.ServiceProvision
 	}
 
-	if s.Router.Dispatch(ctx, id, msg, stream) {
+	err := s.Router.Dispatch(ctx, id, msg, stream)
+	if err == nil {
 		return
 	}
 
-	h := s.handler
-	if h != nil {
-		h.Handle(ctx, id, msg, stream)
+	// If no handler found, delegate to the stream handler.
+	if errors.Is(err, qdef.ErrNoHandler) {
+		h := s.handler
+		if h != nil {
+			h.Handle(ctx, id, msg, stream)
+		}
+		return
 	}
+
+	// Log dispatch errors (encoding failures, panics, etc.)
+	s.logf(id, "dispatch error for %s/%s: %v", msg.Target.Service, msg.Target.Type, err)
 }
 
 func (s *Server) handleRenewal(ctx context.Context, id qdef.Identity, req *qdef.RenewalRequest) (*qdef.CredentialResponse, error) {

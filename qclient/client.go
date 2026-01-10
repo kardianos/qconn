@@ -63,6 +63,10 @@ type Client struct {
 	qcClient  *qconn.Client
 	mu        sync.RWMutex
 	providers map[string]DeviceProvider
+
+	// Lifecycle management for background goroutines.
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewClient initializes a client that handles provisioning and persistent storage.
@@ -94,30 +98,48 @@ func (c *Client) SetObserver(o qdef.ClientObserver) {
 
 // Start begins background processes.
 func (c *Client) Start(ctx context.Context) error {
+	c.mu.Lock()
+	c.ctx, c.cancel = context.WithCancel(ctx)
+	c.mu.Unlock()
 	return c.qcClient.Connect(ctx)
 }
 
 // SetDeviceProvider adds a dynamic device provider to the client.
+// Must be called after Start() for timer providers to work correctly.
 func (c *Client) SetDeviceProvider(name string, p DeviceProvider) {
 	c.mu.Lock()
 	c.providers[name] = p
+	ctx := c.ctx
 	c.mu.Unlock()
 
 	if tp, ok := p.(*timerProvider); ok {
-		go c.runTimerProvider(tp)
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		go c.runTimerProvider(ctx, tp)
 	}
 }
 
-func (c *Client) runTimerProvider(t *timerProvider) {
+func (c *Client) runTimerProvider(ctx context.Context, t *timerProvider) {
 	ticker := time.NewTicker(t.interval)
 	defer ticker.Stop()
-	for range ticker.C {
-		_ = c.UpdateDevices(context.Background())
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = c.UpdateDevices(ctx)
+		}
 	}
 }
 
-// Close gracefully disconnects.
+// Close gracefully disconnects and stops background goroutines.
 func (c *Client) Close() error {
+	c.mu.Lock()
+	if c.cancel != nil {
+		c.cancel()
+	}
+	c.mu.Unlock()
 	c.qcClient.Close()
 	return nil
 }

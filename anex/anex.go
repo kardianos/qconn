@@ -14,8 +14,9 @@ import (
 
 // RoleConfig defines what a role can do.
 type RoleConfig struct {
-	Provides []string // Job types this role provides.
-	SendsTo  []string // Job types this role can send to.
+	Provides       []string // Job types this role provides.
+	SendsTo        []string // Job types this role can send to.
+	MaxPayloadSize int      // Max payload size in bytes for Provides types (0 = use default).
 }
 
 // AddressUpdater is called when a client connects to update their last known address.
@@ -142,6 +143,24 @@ func (h *Hub) canProvide(receiverRoles []string, jobType string) bool {
 	return false
 }
 
+// getPayloadLimit returns the max payload size for a job type based on which role provides it.
+// Returns 0 if no limit is configured (use default).
+func (h *Hub) getPayloadLimit(receiverRoles []string, jobType string) int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	for _, roleName := range receiverRoles {
+		if def, ok := h.roleDefs[roleName]; ok {
+			for _, providedJob := range def.Provides {
+				if providedJob == jobType {
+					return def.MaxPayloadSize
+				}
+			}
+		}
+	}
+	return 0
+}
+
 func (h *Hub) RegisterHandlers(r *qdef.StreamRouter) {
 	qdef.Handle(r, qdef.ServiceSystem, "devices", h.handleDeviceUpdate)
 	qdef.Handle(r, qdef.ServiceSystem, "list-machines", h.handleListMachines)
@@ -260,6 +279,17 @@ func (h *Hub) Route(ctx context.Context, senderID qdef.Identity, msg qdef.Messag
 			receiverRoles := h.getReceiverRoles(msg.Target.Machine)
 			if !h.canProvide(receiverRoles, msg.Target.Type) {
 				return nil, qdef.UnauthorizedTargetError{Target: msg.Target.Machine, JobType: msg.Target.Type}
+			}
+
+			// Check payload size against per-type limit.
+			if limit := h.getPayloadLimit(receiverRoles, msg.Target.Type); limit > 0 {
+				if len(msg.Payload) > limit {
+					return nil, qdef.PayloadTooLargeError{
+						JobType: msg.Target.Type,
+						Size:    len(msg.Payload),
+						Limit:   limit,
+					}
+				}
 			}
 
 			return h.forward(ctx, conn, msg)

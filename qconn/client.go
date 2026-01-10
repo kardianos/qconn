@@ -568,7 +568,7 @@ func (c *Client) acceptLoop(ctx context.Context, conn *quic.Conn) {
 			return
 		}
 		go func(stream qdef.Stream) {
-			dec := cbor.NewDecoder(stream)
+			dec := qdef.NewDecoder(stream, 0) // Use default limit for client.
 			var msg qdef.Message
 			if err := dec.Decode(&msg); err != nil {
 				return
@@ -577,13 +577,21 @@ func (c *Client) acceptLoop(ctx context.Context, conn *quic.Conn) {
 			id := c.identity
 			c.mu.RUnlock()
 
-			if c.Router.Dispatch(ctx, id, msg, stream) {
+			err := c.Router.Dispatch(ctx, id, msg, stream)
+			if err == nil {
 				return
 			}
 
-			if c.opt.Handler != nil {
-				c.opt.Handler.Handle(ctx, id, msg, stream)
+			// If no handler found, delegate to the stream handler.
+			if errors.Is(err, qdef.ErrNoHandler) {
+				if c.opt.Handler != nil {
+					c.opt.Handler.Handle(ctx, id, msg, stream)
+				}
+				return
 			}
+
+			// Log dispatch errors.
+			c.logf("dispatch error for %s/%s: %v", msg.Target.Service, msg.Target.Type, err)
 		}(stream)
 	}
 }

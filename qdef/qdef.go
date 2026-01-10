@@ -14,6 +14,30 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+// Default CBOR message size limits.
+const (
+	// DefaultMaxMessageSize is the default maximum size for CBOR messages (1MB).
+	DefaultMaxMessageSize = 1 << 20
+
+	// ProvisioningMaxMessageSize is the maximum size for provisioning messages (64KB).
+	// Provisioning messages only contain CSR and hostname, so should be small.
+	ProvisioningMaxMessageSize = 64 << 10
+)
+
+// NewDecoder creates a CBOR decoder with the specified maximum message size.
+// If maxSize is 0, DefaultMaxMessageSize is used.
+func NewDecoder(r io.Reader, maxSize int) *cbor.Decoder {
+	if maxSize <= 0 {
+		maxSize = DefaultMaxMessageSize
+	}
+	dm, _ := cbor.DecOptions{
+		MaxArrayElements: 1024,
+		MaxMapPairs:      1024,
+		MaxNestedLevels:  32,
+	}.DecModeWithTags(cbor.NewTagSet())
+	return dm.NewDecoder(io.LimitReader(r, int64(maxSize)))
+}
+
 // StreamHandler defines the application-level logic for handling QUIC streams.
 type StreamHandler interface {
 	RegisterHandlers(r *StreamRouter)
@@ -164,6 +188,25 @@ func (e TargetUnavailableError) Error() string {
 
 func (e TargetUnavailableError) Unwrap() error {
 	return ErrTargetNotFound
+}
+
+// ErrPayloadTooLarge is returned when a message payload exceeds the configured limit.
+var ErrPayloadTooLarge = fmt.Errorf("qconn: payload too large")
+
+// PayloadTooLargeError provides details about the payload size violation.
+type PayloadTooLargeError struct {
+	JobType string
+	Size    int
+	Limit   int
+}
+
+func (e PayloadTooLargeError) Error() string {
+	return fmt.Sprintf("%s: payload size %d exceeds limit %d for job type %q",
+		ErrPayloadTooLarge, e.Size, e.Limit, e.JobType)
+}
+
+func (e PayloadTooLargeError) Unwrap() error {
+	return ErrPayloadTooLarge
 }
 
 // MachineNotConnectedError is returned when a target machine is not connected.

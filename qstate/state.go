@@ -87,3 +87,10 @@ func (sm *Machine[S]) MustTransitionTo(to S) {
 		panic(err)
 	}
 }
+
+// Current returns the current state.
+func (sm *Machine[S]) Current() S {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.current
+}

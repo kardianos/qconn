@@ -5,41 +5,47 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/kardianos/qconn/anex"
-	"github.com/kardianos/qconn/qclient"
 	"github.com/kardianos/qconn/qconn"
 	"github.com/kardianos/qconn/qdef"
 	"github.com/kardianos/qconn/qmanage"
 	"github.com/kardianos/qconn/qmock"
+	"go.etcd.io/bbolt"
 )
 
 func TestClientStoreOperations(t *testing.T) {
 	dir := t.TempDir()
 
-	store, err := qmanage.NewClientStoreWithDir(dir)
+	// Create store with identity and token set at initialization.
+	cfg := qmanage.ClientStoreConfig{
+		Dir:            dir,
+		Hostname:       "test-host",
+		Roles:          []string{"worker"},
+		ProvisionToken: "test-token-123",
+	}
+	store, err := qmanage.NewClientStoreWithDir(cfg)
 	if err != nil {
 		t.Fatalf("NewClientStoreWithDir: %v", err)
 	}
 	defer store.Close()
 
-	// Test initial state.
+	// Test initial state - hostname and roles from config.
 	id, err := store.GetIdentity()
 	if err != nil {
 		t.Fatalf("GetIdentity: %v", err)
 	}
-	if id.Hostname != "" {
-		t.Errorf("expected empty identity, got %v", id)
+	if id.Hostname != "test-host" {
+		t.Errorf("expected hostname 'test-host', got %q", id.Hostname)
 	}
 
-	// Test SetProvisionToken.
-	if err := store.SetProvisionToken("test-token-123"); err != nil {
-		t.Fatalf("SetProvisionToken: %v", err)
-	}
+	// Test ProvisionToken returns the token from config.
 	if token := store.ProvisionToken(); token != "test-token-123" {
 		t.Errorf("expected token 'test-token-123', got %q", token)
 	}
@@ -68,7 +74,7 @@ func TestClientStoreOperations(t *testing.T) {
 	// Setup update channel before save.
 	updateCh := store.OnUpdate()
 
-	if err := store.SaveCredentials(testID, certPEM, keyPEM); err != nil {
+	if err := store.SaveCredentials(certPEM, keyPEM); err != nil {
 		t.Fatalf("SaveCredentials: %v", err)
 	}
 
@@ -120,56 +126,24 @@ func TestAuthManagerOperations(t *testing.T) {
 		t.Fatal("expected non-nil root cert")
 	}
 
-	// Test role definitions.
-	workerRole := qmanage.RoleConfig{
-		Provides: []string{"job"},
-		SendsTo:  []string{"status"},
+	// Test client status via provisioning.
+	csrPEM, _, err := qdef.CreateCSR("test-client")
+	if err != nil {
+		t.Fatalf("CreateCSR: %v", err)
 	}
-	if err := auth.SetRoleDef("worker", workerRole); err != nil {
-		t.Fatalf("SetRoleDef: %v", err)
+	certPEM, err := auth.SignProvisioningCSR(csrPEM, "test-client", []string{"worker"})
+	if err != nil {
+		t.Fatalf("SignProvisioningCSR: %v", err)
 	}
+	block, _ := pem.Decode(certPEM)
+	leaf, _ := x509.ParseCertificate(block.Bytes)
+	fp := qdef.FingerprintOf(leaf)
 
-	retrieved, ok := auth.GetRoleDef("worker")
-	if !ok {
-		t.Fatal("expected to find worker role")
-	}
-	if len(retrieved.Provides) != 1 || retrieved.Provides[0] != "job" {
-		t.Errorf("unexpected role config: %+v", retrieved)
-	}
-
-	roles := auth.ListRoleDefs()
-	if len(roles) != 1 {
-		t.Errorf("expected 1 role, got %d", len(roles))
-	}
-
-	// Test static authorizations.
-	fp := "abc123fingerprint"
-	if err := auth.SetStaticAuthorization(fp, []string{"worker", "admin"}); err != nil {
-		t.Fatalf("SetStaticAuthorization: %v", err)
-	}
-
-	got := auth.GetStaticAuthorization(fp)
-	if len(got) != 2 {
-		t.Errorf("expected 2 roles, got %d", len(got))
-	}
-
-	// Test AuthorizeRoles filtering.
-	authorized := auth.AuthorizeRoles(fp, []string{"worker", "superadmin"})
-	if len(authorized) != 1 || authorized[0] != "worker" {
-		t.Errorf("expected only 'worker' authorized, got %v", authorized)
-	}
-
-	auths := auth.ListAuthorizations()
-	if len(auths) != 1 {
-		t.Errorf("expected 1 authorization, got %d", len(auths))
-	}
-
-	// Test client status.
 	if err := auth.SetClientStatus(fp, qdef.StatusAuthorized); err != nil {
 		t.Fatalf("SetClientStatus: %v", err)
 	}
 
-	clients := auth.ListClients()
+	clients := auth.ListClients(qmanage.ClientFilter{})
 	if len(clients) != 1 {
 		t.Errorf("expected 1 client, got %d", len(clients))
 	}
@@ -207,7 +181,7 @@ func TestProvisioningCSR(t *testing.T) {
 	}
 
 	// Sign provisioning CSR.
-	certPEM, err := auth.SignProvisioningCSR(csrPEM, "test-client")
+	certPEM, err := auth.SignProvisioningCSR(csrPEM, "test-client", nil)
 	if err != nil {
 		t.Fatalf("SignProvisioningCSR: %v", err)
 	}
@@ -226,8 +200,8 @@ func TestProvisioningCSR(t *testing.T) {
 	}
 
 	// Verify client was tracked.
-	fp := qdef.FingerprintHex(leaf)
-	status, err := auth.GetStatus(leaf)
+	fp := qdef.FingerprintOf(leaf)
+	status, err := auth.GetStatus(fp)
 	if err != nil {
 		t.Fatalf("GetStatus: %v", err)
 	}
@@ -235,7 +209,7 @@ func TestProvisioningCSR(t *testing.T) {
 		t.Errorf("expected StatusUnauthorized, got %v", status)
 	}
 
-	clients := auth.ListClients()
+	clients := auth.ListClients(qmanage.ClientFilter{})
 	if _, ok := clients[fp]; !ok {
 		t.Error("expected client to be tracked")
 	}
@@ -259,7 +233,7 @@ func TestRenewalCSR(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateCSR: %v", err)
 	}
-	certPEM, err := auth.SignProvisioningCSR(csrPEM, "test-client")
+	certPEM, err := auth.SignProvisioningCSR(csrPEM, "test-client", nil)
 	if err != nil {
 		t.Fatalf("SignProvisioningCSR: %v", err)
 	}
@@ -267,14 +241,11 @@ func TestRenewalCSR(t *testing.T) {
 	// Get fingerprint.
 	block, _ := pem.Decode(certPEM)
 	leaf, _ := x509.ParseCertificate(block.Bytes)
-	oldFP := qdef.FingerprintHex(leaf)
+	oldFP := qdef.FingerprintOf(leaf)
 
 	// Authorize the client.
 	if err := auth.SetClientStatus(oldFP, qdef.StatusAuthorized); err != nil {
 		t.Fatalf("SetClientStatus: %v", err)
-	}
-	if err := auth.SetStaticAuthorization(oldFP, []string{"worker"}); err != nil {
-		t.Fatalf("SetStaticAuthorization: %v", err)
 	}
 
 	// Create renewal CSR.
@@ -292,14 +263,14 @@ func TestRenewalCSR(t *testing.T) {
 	// Get new fingerprint.
 	block, _ = pem.Decode(newCertPEM)
 	newLeaf, _ := x509.ParseCertificate(block.Bytes)
-	newFP := qdef.FingerprintHex(newLeaf)
+	newFP := qdef.FingerprintOf(newLeaf)
 
 	if newFP == oldFP {
 		t.Error("expected different fingerprint after renewal")
 	}
 
 	// Verify status was preserved.
-	status, err := auth.GetStatus(newLeaf)
+	status, err := auth.GetStatus(newFP)
 	if err != nil {
 		t.Fatalf("GetStatus: %v", err)
 	}
@@ -307,16 +278,10 @@ func TestRenewalCSR(t *testing.T) {
 		t.Errorf("expected StatusAuthorized after renewal, got %v", status)
 	}
 
-	// Verify authorizations were migrated.
-	roles := auth.GetStaticAuthorization(newFP)
-	if len(roles) != 1 || roles[0] != "worker" {
-		t.Errorf("expected roles to migrate, got %v", roles)
-	}
-
 	// Verify old fingerprint was removed.
-	oldRoles := auth.GetStaticAuthorization(oldFP)
-	if len(oldRoles) != 0 {
-		t.Errorf("expected old fingerprint to be removed, got %v", oldRoles)
+	clients := auth.ListClients(qmanage.ClientFilter{Fingerprints: []qdef.FP{oldFP}})
+	if len(clients) != 0 {
+		t.Errorf("expected old fingerprint to be removed")
 	}
 }
 
@@ -329,8 +294,8 @@ func TestFullIntegration(t *testing.T) {
 	authCfg := qmanage.AuthManagerConfig{
 		AppName:         "test",
 		DataDir:         serverDir,
-		ServerHostname:  "localhost", // Match the address clients connect to.
-		CleanupInterval: -1,          // Disable cleanup goroutine for test.
+		ServerHostname:  "localhost",
+		CleanupInterval: -1,
 	}
 	authMgr, err := qmanage.NewAuthManager(authCfg)
 	if err != nil {
@@ -338,25 +303,21 @@ func TestFullIntegration(t *testing.T) {
 	}
 	defer authMgr.Close()
 
-	// Setup Hub with role definitions.
-	hub := anex.NewHub(10 * time.Second)
-	hub.SetRoleDef("printer-provider", anex.RoleConfig{
-		Provides: []string{"printer"},
-	})
-	hub.SetRoleDef("print-requester", anex.RoleConfig{
-		SendsTo: []string{"printer"},
-	})
-
-	// Setup server.
+	// Setup server with built-in role management.
 	server, err := qconn.NewServer(qconn.ServerOpt{
 		Auth:     authMgr,
-		Handler:  hub,
-		Listener: hub,
 		Observer: qmock.NewTestObserver(ctx, t),
 	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
+
+	server.SetRoleDef("printer-provider", qdef.RoleConfig{
+		Provides: []string{"printer"},
+	})
+	server.SetRoleDef("print-requester", qdef.RoleConfig{
+		SendsTo: []string{"printer"},
+	})
 
 	// Start server.
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -370,13 +331,13 @@ func TestFullIntegration(t *testing.T) {
 
 	go server.Serve(ctx, packetConn)
 
-	// Create provider client using CSR flow.
+	// Create provider client using CSR flow (with roles).
 	providerID := qdef.Identity{Hostname: "provider-01"}
 	providerCSRPEM, providerKeyPEM, err := qdef.CreateCSR("provider-01")
 	if err != nil {
 		t.Fatalf("CreateCSR: %v", err)
 	}
-	providerCertPEM, err := authMgr.SignProvisioningCSR(providerCSRPEM, "provider-01")
+	providerCertPEM, err := authMgr.SignProvisioningCSR(providerCSRPEM, "provider-01", []string{"printer-provider"})
 	if err != nil {
 		t.Fatalf("SignProvisioningCSR: %v", err)
 	}
@@ -391,10 +352,7 @@ func TestFullIntegration(t *testing.T) {
 	}
 
 	// Authorize provider.
-	provFpStr := providerID.Fingerprint.String()
-	authMgr.SetClientStatus(provFpStr, qdef.StatusAuthorized)
-	authMgr.SetStaticAuthorization(provFpStr, []string{"printer-provider"})
-	hub.SetStaticAuthorization(provFpStr, []string{"printer-provider"})
+	authMgr.SetClientStatus(providerID.Fingerprint, qdef.StatusAuthorized)
 
 	provStore := &mockCredentialStore{
 		id:         providerID,
@@ -403,28 +361,35 @@ func TestFullIntegration(t *testing.T) {
 		rootCACert: authMgr.RootCert(),
 	}
 
-	provClient := qclient.NewClient(addr, provStore)
+	resolver := &qmock.MockResolver{}
+	resolver.SetAddress(addr)
+
+	provClient := qconn.NewClient(qconn.ClientOpt{
+		ServerHostname:  "localhost",
+		CredentialStore: provStore,
+		Resolver:        resolver,
+	})
 
 	type PrintReq struct{ Content string }
 	type PrintResp struct{ OK bool }
 
-	_ = qclient.Handle(provClient, "printer", qclient.StaticDevices("printer"), func(ctx context.Context, id qdef.Identity, req *PrintReq) (*PrintResp, error) {
+	qdef.Handle(&provClient.Router, qdef.ServiceUser, "printer", func(ctx context.Context, id qdef.Identity, req *PrintReq) (*PrintResp, error) {
 		t.Logf("Provider received print request: %s", req.Content)
 		return &PrintResp{OK: true}, nil
 	})
 
-	if err := provClient.Start(ctx); err != nil {
-		t.Fatalf("Provider start: %v", err)
+	if err := provClient.Connect(ctx); err != nil {
+		t.Fatalf("Provider connect: %v", err)
 	}
 	defer provClient.Close()
 
-	// Wait for provider to connect and register devices.
+	// Wait for provider to connect.
 	deadline := time.Now().Add(5 * time.Second)
 	providerOnline := false
 	for time.Now().Before(deadline) {
-		states := hub.ListHostStates(false)
-		for _, s := range states {
-			if s.Identity.Hostname == "provider-01" && s.Online && len(s.Identity.Devices) > 0 {
+		clients := authMgr.ListClientsInfo(true, nil)
+		for _, c := range clients {
+			if c.Hostname == "provider-01" && c.Online {
 				providerOnline = true
 				break
 			}
@@ -438,16 +403,13 @@ func TestFullIntegration(t *testing.T) {
 		t.Fatal("provider did not come online in time")
 	}
 
-	// Re-trigger state change to sync roles with hub.
-	hub.OnStateChange(providerID, qdef.StateAuthorized)
-
-	// Create requester client.
+	// Create requester client (with roles).
 	requesterID := qdef.Identity{Hostname: "requester-01"}
 	csrPEM, requesterKeyPEM, err := qdef.CreateCSR("requester-01")
 	if err != nil {
 		t.Fatalf("CreateCSR: %v", err)
 	}
-	requesterCertPEM, err := authMgr.SignProvisioningCSR(csrPEM, "requester-01")
+	requesterCertPEM, err := authMgr.SignProvisioningCSR(csrPEM, "requester-01", []string{"print-requester"})
 	if err != nil {
 		t.Fatalf("SignProvisioningCSR: %v", err)
 	}
@@ -461,10 +423,7 @@ func TestFullIntegration(t *testing.T) {
 	}
 
 	// Authorize requester.
-	reqFpStr := requesterID.Fingerprint.String()
-	authMgr.SetClientStatus(reqFpStr, qdef.StatusAuthorized)
-	authMgr.SetStaticAuthorization(reqFpStr, []string{"print-requester"})
-	hub.SetStaticAuthorization(reqFpStr, []string{"print-requester"})
+	authMgr.SetClientStatus(requesterID.Fingerprint, qdef.StatusAuthorized)
 
 	reqStore := &mockCredentialStore{
 		id:         requesterID,
@@ -473,9 +432,16 @@ func TestFullIntegration(t *testing.T) {
 		rootCACert: authMgr.RootCert(),
 	}
 
-	reqClient := qclient.NewClient(addr, reqStore)
-	if err := reqClient.Start(ctx); err != nil {
-		t.Fatalf("Requester start: %v", err)
+	reqResolver := &qmock.MockResolver{}
+	reqResolver.SetAddress(addr)
+
+	reqClient := qconn.NewClient(qconn.ClientOpt{
+		ServerHostname:  "localhost",
+		CredentialStore: reqStore,
+		Resolver:        reqResolver,
+	})
+	if err := reqClient.Connect(ctx); err != nil {
+		t.Fatalf("Requester connect: %v", err)
 	}
 	defer reqClient.Close()
 
@@ -483,9 +449,9 @@ func TestFullIntegration(t *testing.T) {
 	deadline = time.Now().Add(5 * time.Second)
 	requesterOnline := false
 	for time.Now().Before(deadline) {
-		states := hub.ListHostStates(false)
-		for _, s := range states {
-			if s.Identity.Hostname == "requester-01" && s.Online {
+		clients := authMgr.ListClientsInfo(true, nil)
+		for _, c := range clients {
+			if c.Hostname == "requester-01" && c.Online {
 				requesterOnline = true
 				break
 			}
@@ -499,16 +465,15 @@ func TestFullIntegration(t *testing.T) {
 		t.Fatal("requester did not come online in time")
 	}
 
-	hub.OnStateChange(requesterID, qdef.StateAuthorized)
-
 	// Send print request.
 	target := qdef.Addr{
 		Service: qdef.ServiceUser,
 		Type:    "printer",
-		Machine: providerID.Fingerprint.String(),
+		Machine: providerID.Fingerprint,
 	}
 
-	resp, err := qclient.Request[PrintReq, PrintResp](reqClient, ctx, target, &PrintReq{Content: "Hello from test"})
+	var resp PrintResp
+	_, err = reqClient.Request(ctx, target, &PrintReq{Content: "Hello from test"}, &resp)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -537,7 +502,7 @@ func TestRevocation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateCSR: %v", err)
 	}
-	certPEM, err := auth.SignProvisioningCSR(csrPEM, "test-client")
+	certPEM, err := auth.SignProvisioningCSR(csrPEM, "test-client", nil)
 	if err != nil {
 		t.Fatalf("SignProvisioningCSR: %v", err)
 	}
@@ -546,15 +511,15 @@ func TestRevocation(t *testing.T) {
 	leaf, _ := x509.ParseCertificate(block.Bytes)
 	fp := qdef.FingerprintOf(leaf)
 
-	auth.SetClientStatus(fp.String(), qdef.StatusAuthorized)
+	auth.SetClientStatus(fp, qdef.StatusAuthorized)
 
 	// Revoke the client.
-	if err := auth.Revoke(qdef.Identity{Fingerprint: fp}); err != nil {
+	if err := auth.SetClientStatus(fp, qdef.StatusRevoked); err != nil {
 		t.Fatalf("Revoke: %v", err)
 	}
 
 	// Verify status.
-	status, err := auth.GetStatus(leaf)
+	status, err := auth.GetStatus(fp)
 	if err != nil {
 		t.Fatalf("GetStatus: %v", err)
 	}
@@ -564,13 +529,13 @@ func TestRevocation(t *testing.T) {
 
 	// Verify renewal fails.
 	newCSRPEM, _, _ := qdef.CreateCSR("test-client")
-	_, err = auth.SignRenewalCSR(newCSRPEM, fp.String())
+	_, err = auth.SignRenewalCSR(newCSRPEM, fp)
 	if err != qdef.ErrClientRevoked {
 		t.Errorf("expected ErrClientRevoked, got %v", err)
 	}
 }
 
-func TestSignalChannel(t *testing.T) {
+func TestWaitFor(t *testing.T) {
 	dir := t.TempDir()
 
 	cfg := qmanage.AuthManagerConfig{
@@ -588,29 +553,26 @@ func TestSignalChannel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateCSR: %v", err)
 	}
-	certPEM, err := auth.SignProvisioningCSR(csrPEM, "test-client")
+	certPEM, err := auth.SignProvisioningCSR(csrPEM, "test-client", nil)
 	if err != nil {
 		t.Fatalf("SignProvisioningCSR: %v", err)
 	}
 
 	block, _ := pem.Decode(certPEM)
 	leaf, _ := x509.ParseCertificate(block.Bytes)
-
-	// Get signal channel.
-	sig := auth.GetSignal(leaf)
+	fp := qdef.FingerprintOf(leaf)
 
 	// Change status in goroutine.
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		auth.SetClientStatus(qdef.FingerprintHex(leaf), qdef.StatusAuthorized)
+		auth.SetClientStatus(fp, qdef.StatusAuthorized)
 	}()
 
-	// Wait for signal.
-	select {
-	case <-sig:
-		// Good.
-	case <-time.After(1 * time.Second):
-		t.Error("expected signal channel to be closed")
+	// Wait for status change.
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	if err := auth.WaitFor(ctx, fp); err != nil {
+		t.Errorf("WaitFor returned error: %v", err)
 	}
 }
 
@@ -628,11 +590,8 @@ func TestPersistence(t *testing.T) {
 	}
 
 	// Add some data.
-	auth1.SetRoleDef("worker", qmanage.RoleConfig{Provides: []string{"job"}})
-	auth1.SetStaticAuthorization("fp123", []string{"worker"})
-
 	csrPEM, _, _ := qdef.CreateCSR("test-client")
-	auth1.SignProvisioningCSR(csrPEM, "test-client")
+	auth1.SignProvisioningCSR(csrPEM, "test-client", []string{"worker"})
 
 	caCert := auth1.RootCert()
 	auth1.Close()
@@ -645,29 +604,85 @@ func TestPersistence(t *testing.T) {
 	defer auth2.Close()
 
 	// CA should be the same.
-	if qdef.FingerprintHex(auth2.RootCert()) != qdef.FingerprintHex(caCert) {
+	if qdef.FingerprintOf(auth2.RootCert()) != qdef.FingerprintOf(caCert) {
 		t.Error("CA fingerprint changed after reopen")
 	}
 
-	// Role should be present.
-	role, ok := auth2.GetRoleDef("worker")
-	if !ok {
-		t.Error("expected worker role to persist")
-	}
-	if len(role.Provides) != 1 || role.Provides[0] != "job" {
-		t.Errorf("unexpected role config: %+v", role)
-	}
-
-	// Authorization should be present.
-	roles := auth2.GetStaticAuthorization("fp123")
-	if len(roles) != 1 || roles[0] != "worker" {
-		t.Errorf("expected authorization to persist, got %v", roles)
-	}
-
 	// Client should be present.
-	clients := auth2.ListClients()
+	clients := auth2.ListClients(qmanage.ClientFilter{})
 	if len(clients) != 1 {
 		t.Errorf("expected 1 client, got %d", len(clients))
+	}
+}
+
+func TestBackup(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create auth manager with backup disabled (we'll call Backup manually).
+	cfg := qmanage.AuthManagerConfig{
+		AppName:         "test",
+		DataDir:         dir,
+		CleanupInterval: -1,
+	}
+	auth, err := qmanage.NewAuthManager(cfg)
+	if err != nil {
+		t.Fatalf("NewAuthManager: %v", err)
+	}
+
+	// Add some data.
+	csrPEM, _, err := qdef.CreateCSR("backup-client")
+	if err != nil {
+		t.Fatalf("CreateCSR: %v", err)
+	}
+	certPEM, err := auth.SignProvisioningCSR(csrPEM, "backup-client", []string{"worker"})
+	if err != nil {
+		t.Fatalf("SignProvisioningCSR: %v", err)
+	}
+	block, _ := pem.Decode(certPEM)
+	leaf, _ := x509.ParseCertificate(block.Bytes)
+	clientFP := qdef.FingerprintOf(leaf)
+
+	// Authorize the client.
+	auth.SetClientStatus(clientFP, qdef.StatusAuthorized)
+
+	// Create backup.
+	if err := auth.Backup(); err != nil {
+		t.Fatalf("Backup: %v", err)
+	}
+
+	// Verify backup file exists.
+	backupPath := filepath.Join(dir, "auth.db.backup")
+	info, err := os.Stat(backupPath)
+	if err != nil {
+		t.Fatalf("backup file not found: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Error("backup file is empty")
+	}
+
+	// Close original and open backup to verify contents.
+	auth.Close()
+
+	// Open backup database directly.
+	backupDB, err := bbolt.Open(backupPath, 0600, &bbolt.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("open backup: %v", err)
+	}
+	defer backupDB.Close()
+
+	// Verify client exists in backup.
+	err = backupDB.View(func(tx *bbolt.Tx) error {
+		clientsBucket := tx.Bucket([]byte("clients"))
+		if clientsBucket == nil {
+			return fmt.Errorf("clients bucket not found")
+		}
+		if clientsBucket.Get(clientFP[:]) == nil {
+			return fmt.Errorf("client not found in backup")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Errorf("verify backup clients: %v", err)
 	}
 }
 
@@ -687,27 +702,26 @@ func TestCleanupExpiredClients(t *testing.T) {
 	defer auth.Close()
 
 	// Create 3 clients.
-	var fingerprints []string
+	var fingerprints []qdef.FP
 	for i := 0; i < 3; i++ {
 		hostname := "client-" + string(rune('a'+i))
 		csrPEM, _, err := qdef.CreateCSR(hostname)
 		if err != nil {
 			t.Fatalf("CreateCSR: %v", err)
 		}
-		certPEM, err := auth.SignProvisioningCSR(csrPEM, hostname)
+		certPEM, err := auth.SignProvisioningCSR(csrPEM, hostname, []string{"worker"})
 		if err != nil {
 			t.Fatalf("SignProvisioningCSR: %v", err)
 		}
 
 		block, _ := pem.Decode(certPEM)
 		leaf, _ := x509.ParseCertificate(block.Bytes)
-		fingerprints = append(fingerprints, qdef.FingerprintHex(leaf))
+		fingerprints = append(fingerprints, qdef.FingerprintOf(leaf))
 	}
 
-	// Authorize all clients and give them roles.
+	// Authorize all clients.
 	for _, fp := range fingerprints {
 		auth.SetClientStatus(fp, qdef.StatusAuthorized)
-		auth.SetStaticAuthorization(fp, []string{"worker"})
 	}
 
 	// Set expiry for first two clients to be in the past.
@@ -720,19 +734,22 @@ func TestCleanupExpiredClients(t *testing.T) {
 	}
 
 	// Verify all 3 clients exist.
-	clients := auth.ListClients()
+	clients := auth.ListClients(qmanage.ClientFilter{})
 	if len(clients) != 3 {
 		t.Fatalf("expected 3 clients, got %d", len(clients))
 	}
 
 	// Run cleanup.
-	removed := auth.CleanupExpiredClients()
+	removed, err := auth.CleanupExpiredClients()
+	if err != nil {
+		t.Fatalf("cleanup failed: %v", err)
+	}
 	if removed != 2 {
 		t.Errorf("expected 2 clients removed, got %d", removed)
 	}
 
 	// Verify only the non-expired client remains.
-	clients = auth.ListClients()
+	clients = auth.ListClients(qmanage.ClientFilter{})
 	if len(clients) != 1 {
 		t.Errorf("expected 1 client remaining, got %d", len(clients))
 	}
@@ -742,17 +759,10 @@ func TestCleanupExpiredClients(t *testing.T) {
 		t.Error("expected non-expired client to remain")
 	}
 
-	// Verify authorizations for expired clients were also removed.
-	if roles := auth.GetStaticAuthorization(fingerprints[0]); len(roles) != 0 {
-		t.Errorf("expected authorization for expired client to be removed, got %v", roles)
-	}
-	if roles := auth.GetStaticAuthorization(fingerprints[1]); len(roles) != 0 {
-		t.Errorf("expected authorization for expired client to be removed, got %v", roles)
-	}
-
-	// Verify non-expired client's authorization remains.
-	if roles := auth.GetStaticAuthorization(fingerprints[2]); len(roles) != 1 {
-		t.Errorf("expected authorization for non-expired client to remain, got %v", roles)
+	// Verify non-expired client's roles remain.
+	client := clients[fingerprints[2]]
+	if len(client.RequestedRoles) != 1 || client.RequestedRoles[0] != "worker" {
+		t.Errorf("expected non-expired client to have worker role, got %v", client.RequestedRoles)
 	}
 }
 
@@ -775,53 +785,88 @@ func TestUpdateClientAddr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateCSR: %v", err)
 	}
-	certPEM, err := auth.SignProvisioningCSR(csrPEM, "test-client")
+	certPEM, err := auth.SignProvisioningCSR(csrPEM, "test-client", nil)
 	if err != nil {
 		t.Fatalf("SignProvisioningCSR: %v", err)
 	}
 
 	block, _ := pem.Decode(certPEM)
 	leaf, _ := x509.ParseCertificate(block.Bytes)
-	fp := qdef.FingerprintHex(leaf)
+	fp := qdef.FingerprintOf(leaf)
 
 	// Initially LastAddr should be zero value.
-	clients := auth.ListClients()
+	clients := auth.ListClients(qmanage.ClientFilter{})
 	if clients[fp].LastAddr.IsValid() {
 		t.Errorf("expected zero LastAddr, got %v", clients[fp].LastAddr)
 	}
 
 	// Update the address.
 	testAddr := netip.MustParseAddrPort("192.168.1.100:54321")
-	if err := auth.UpdateClientAddr(fp, testAddr); err != nil {
+	if err := auth.UpdateClientAddr(fp, true, testAddr, "test-host"); err != nil {
 		t.Fatalf("UpdateClientAddr: %v", err)
 	}
 
-	// Verify the address was updated.
-	clients = auth.ListClients()
+	// Verify the address was updated and client is now online.
+	clients = auth.ListClients(qmanage.ClientFilter{})
 	if clients[fp].LastAddr != testAddr {
 		t.Errorf("expected LastAddr %v, got %v", testAddr, clients[fp].LastAddr)
+	}
+	if !clients[fp].Online {
+		t.Error("expected client to be online after UpdateClientAddr")
+	}
+	if clients[fp].LastSeen.IsZero() {
+		t.Error("expected LastSeen to be set after UpdateClientAddr")
 	}
 
 	// Update to a new address.
 	newAddr := netip.MustParseAddrPort("10.0.0.50:12345")
-	if err := auth.UpdateClientAddr(fp, newAddr); err != nil {
+	if err := auth.UpdateClientAddr(fp, true, newAddr, "test-host"); err != nil {
 		t.Fatalf("UpdateClientAddr: %v", err)
 	}
 
 	// Verify the address was updated again.
-	clients = auth.ListClients()
+	clients = auth.ListClients(qmanage.ClientFilter{})
 	if clients[fp].LastAddr != newAddr {
 		t.Errorf("expected LastAddr %v, got %v", newAddr, clients[fp].LastAddr)
 	}
 
-	// Verify updating unknown client returns error.
-	err = auth.UpdateClientAddr("unknown-fingerprint", netip.MustParseAddrPort("1.2.3.4:5678"))
-	if err != qdef.ErrUnknownClient {
-		t.Errorf("expected ErrUnknownClient, got %v", err)
+	// Verify setting client offline works.
+	if err := auth.UpdateClientAddr(fp, false, netip.AddrPort{}, ""); err != nil {
+		t.Fatalf("UpdateClientAddr (offline): %v", err)
+	}
+	clients = auth.ListClients(qmanage.ClientFilter{})
+	if clients[fp].Online {
+		t.Error("expected client to be offline after UpdateClientAddr with online=false")
+	}
+
+	// Verify updating unknown client creates a new record (upsert behavior).
+	unknownFP := qdef.FP{0x99, 0x99} // non-zero FP that doesn't exist
+	unknownAddr := netip.MustParseAddrPort("1.2.3.4:5678")
+	err = auth.UpdateClientAddr(unknownFP, true, unknownAddr, "new-host")
+	if err != nil {
+		t.Errorf("UpdateClientAddr for unknown client should succeed, got %v", err)
+	}
+	// Verify the record was created with correct values.
+	clients = auth.ListClients(qmanage.ClientFilter{})
+	newRec, ok := clients[unknownFP]
+	if !ok {
+		t.Fatal("expected new client record to be created")
+	}
+	if newRec.Hostname != "new-host" {
+		t.Errorf("expected hostname 'new-host', got %q", newRec.Hostname)
+	}
+	if newRec.LastAddr != unknownAddr {
+		t.Errorf("expected LastAddr %v, got %v", unknownAddr, newRec.LastAddr)
+	}
+	if !newRec.Online {
+		t.Error("expected new client to be online")
+	}
+	if newRec.Status != qdef.StatusUnauthorized {
+		t.Errorf("expected status Unauthorized, got %v", newRec.Status)
 	}
 }
 
-func TestHubAddressTracking(t *testing.T) {
+func TestServerAddressTracking(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -839,22 +884,17 @@ func TestHubAddressTracking(t *testing.T) {
 	}
 	defer authMgr.Close()
 
-	// Setup Hub with address updater.
-	hub := anex.NewHub(10 * time.Second)
-	hub.SetAddressUpdater(authMgr)
-	hub.SetRoleDef("worker", anex.RoleConfig{
-		Provides: []string{"job"},
-	})
-
 	// Setup server.
 	server, err := qconn.NewServer(qconn.ServerOpt{
-		Auth:     authMgr,
-		Handler:  hub,
-		Listener: hub,
+		Auth: authMgr,
 	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
+
+	server.SetRoleDef("worker", qdef.RoleConfig{
+		Provides: []string{"job"},
+	})
 
 	// Start server.
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -874,7 +914,7 @@ func TestHubAddressTracking(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateCSR: %v", err)
 	}
-	certPEM, err := authMgr.SignProvisioningCSR(csrPEM, "worker-01")
+	certPEM, err := authMgr.SignProvisioningCSR(csrPEM, "worker-01", []string{"worker"})
 	if err != nil {
 		t.Fatalf("SignProvisioningCSR: %v", err)
 	}
@@ -883,17 +923,14 @@ func TestHubAddressTracking(t *testing.T) {
 	block, _ := pem.Decode(certPEM)
 	leaf, _ := x509.ParseCertificate(block.Bytes)
 	clientID.Fingerprint = qdef.FingerprintOf(leaf)
-	clientFpStr := clientID.Fingerprint.String()
 
 	// Authorize client.
-	authMgr.SetClientStatus(clientFpStr, qdef.StatusAuthorized)
-	authMgr.SetStaticAuthorization(clientFpStr, []string{"worker"})
-	hub.SetStaticAuthorization(clientFpStr, []string{"worker"})
+	authMgr.SetClientStatus(clientID.Fingerprint, qdef.StatusAuthorized)
 
 	// Verify LastAddr is initially zero.
-	clients := authMgr.ListClients()
-	if clients[clientFpStr].LastAddr.IsValid() {
-		t.Errorf("expected zero LastAddr before connection, got %v", clients[clientFpStr].LastAddr)
+	clients := authMgr.ListClients(qmanage.ClientFilter{})
+	if clients[clientID.Fingerprint].LastAddr.IsValid() {
+		t.Errorf("expected zero LastAddr before connection, got %v", clients[clientID.Fingerprint].LastAddr)
 	}
 
 	// Connect client.
@@ -904,9 +941,16 @@ func TestHubAddressTracking(t *testing.T) {
 		rootCACert: authMgr.RootCert(),
 	}
 
-	client := qclient.NewClient(addr, clientStore)
-	if err := client.Start(ctx); err != nil {
-		t.Fatalf("Client start: %v", err)
+	resolver := &qmock.MockResolver{}
+	resolver.SetAddress(addr)
+
+	client := qconn.NewClient(qconn.ClientOpt{
+		ServerHostname:  "localhost",
+		CredentialStore: clientStore,
+		Resolver:        resolver,
+	})
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Client connect: %v", err)
 	}
 	defer client.Close()
 
@@ -914,9 +958,9 @@ func TestHubAddressTracking(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	connected := false
 	for time.Now().Before(deadline) {
-		states := hub.ListHostStates(false)
-		for _, s := range states {
-			if s.Identity.Hostname == "worker-01" && s.Online {
+		clients := authMgr.ListClientsInfo(true, nil)
+		for _, c := range clients {
+			if c.Hostname == "worker-01" && c.Online {
 				connected = true
 				break
 			}
@@ -934,8 +978,8 @@ func TestHubAddressTracking(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Verify LastAddr was updated.
-	clients = authMgr.ListClients()
-	lastAddr := clients[clientFpStr].LastAddr
+	clients = authMgr.ListClients(qmanage.ClientFilter{})
+	lastAddr := clients[clientID.Fingerprint].LastAddr
 	if !lastAddr.IsValid() {
 		t.Fatal("expected LastAddr to be set after connection")
 	}
@@ -971,8 +1015,19 @@ func (s *mockCredentialStore) GetRootCAs() (*x509.CertPool, error) {
 	pool.AddCert(s.rootCACert)
 	return pool, nil
 }
-func (s *mockCredentialStore) SaveCredentials(id qdef.Identity, certPEM, keyPEM []byte) error {
-	s.id, s.certPEM, s.keyPEM = id, certPEM, keyPEM
+func (s *mockCredentialStore) SetRootCA(certPEM []byte) error {
+	return nil // Not used in tests
+}
+func (s *mockCredentialStore) SaveCredentials(certPEM, keyPEM []byte) error {
+	s.certPEM, s.keyPEM = certPEM, keyPEM
+	// Extract fingerprint from cert.
+	block, _ := pem.Decode(certPEM)
+	if block != nil {
+		leaf, _ := x509.ParseCertificate(block.Bytes)
+		if leaf != nil {
+			s.id.Fingerprint = qdef.FingerprintOf(leaf)
+		}
+	}
 	return nil
 }
 func (s *mockCredentialStore) OnUpdate() <-chan struct{} { return nil }

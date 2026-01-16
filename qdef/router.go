@@ -61,44 +61,22 @@ func (e NoHandlerError) Unwrap() error {
 	return ErrNoHandler
 }
 
-// Dispatch decodes a message and calls the appropriate handler.
-// Returns nil on success, ErrNoHandler if no handler is registered,
-// or another error if processing fails.
-func (r *StreamRouter) Dispatch(ctx context.Context, id Identity, msg Message, stream Stream) error {
+// Dispatch decodes a message payload, calls the appropriate handler, and returns
+// the response. The caller is responsible for encoding the response to the stream.
+// Returns (response, nil) on success, (nil, NoHandlerError) if no handler is registered,
+// or (nil, error) if processing fails.
+func (r *StreamRouter) Dispatch(ctx context.Context, id Identity, msg Message) (any, error) {
 	r.mu.RLock()
 	handler, ok := r.handlers[serviceKey{service: msg.Target.Service, name: msg.Target.Type}]
 	r.mu.RUnlock()
 	if !ok {
-		return NoHandlerError{Service: msg.Target.Service, Type: msg.Target.Type}
+		return nil, NoHandlerError{Service: msg.Target.Service, Type: msg.Target.Type}
 	}
-	defer func() { _ = stream.Close() }()
-
-	var dispatchErr error
-
-	// Helper to send error response. Records encoding errors.
-	sendError := func(errMsg string) {
-		resp := Message{
-			ID:    msg.ID,
-			Error: errMsg,
-		}
-		if err := cbor.NewEncoder(stream).Encode(resp); err != nil {
-			dispatchErr = fmt.Errorf("failed to encode error response: %w", err)
-		}
-	}
-
-	// Recover from panics in handlers to prevent connection corruption.
-	defer func() {
-		if p := recover(); p != nil {
-			dispatchErr = fmt.Errorf("handler panic in %s/%s: %v", msg.Target.Service, msg.Target.Type, p)
-			sendError("internal server error")
-		}
-	}()
 
 	// Use reflection to call the handler.
 	reqPtr := reflect.New(handler.reqType)
 	if err := cbor.Unmarshal(msg.Payload, reqPtr.Interface()); err != nil {
-		sendError(fmt.Sprintf("failed to unmarshal request: %v", err))
-		return dispatchErr
+		return nil, fmt.Errorf("failed to unmarshal request: %w", err)
 	}
 
 	results := handler.fn.Call([]reflect.Value{
@@ -109,22 +87,8 @@ func (r *StreamRouter) Dispatch(ctx context.Context, id Identity, msg Message, s
 
 	respErr := results[1].Interface()
 	if respErr != nil {
-		sendError(respErr.(error).Error())
-		return dispatchErr
+		return nil, respErr.(error)
 	}
 
-	rawResp, err := cbor.Marshal(results[0].Interface())
-	if err != nil {
-		sendError(fmt.Sprintf("failed to marshal response: %v", err))
-		return dispatchErr
-	}
-
-	resp := Message{
-		ID:      msg.ID,
-		Payload: rawResp,
-	}
-	if err := cbor.NewEncoder(stream).Encode(resp); err != nil {
-		return fmt.Errorf("failed to encode response: %w", err)
-	}
-	return dispatchErr
+	return results[0].Interface(), nil
 }

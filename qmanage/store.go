@@ -9,34 +9,20 @@ import (
 	"github.com/kardianos/qconn/qdef"
 )
 
-// ClientStore extends qdef.CredentialStore with additional management methods.
-// It provides persistent storage for client credentials, provision tokens, and root CA.
+// ClientStore extends qdef.CredentialStore with resource management.
+// Identity (hostname, roles) and provision token are set at initialization.
+// Only certificates and keys are persisted to storage.
 type ClientStore interface {
 	qdef.CredentialStore
-
-	// SetProvisionToken stores the provision token used for initial client provisioning.
-	// The token is used to authenticate with the server before receiving a signed certificate.
-	SetProvisionToken(token string) error
-
-	// SetRootCA stores the root CA certificate in PEM format.
-	// This CA is used to verify the server's certificate during TLS handshake.
-	SetRootCA(certPEM []byte) error
 
 	// Close releases any resources held by the store.
 	Close() error
 }
 
-// RoleConfig defines what a role can do.
-type RoleConfig struct {
-	Provides       []string `cbor:"1,keyasint"` // Job types this role provides.
-	SendsTo        []string `cbor:"2,keyasint"` // Job types this role can send to.
-	MaxPayloadSize int      `cbor:"3,keyasint"` // Max payload size in bytes for Provides types (0 = use default).
-}
-
 // ClientRecord stores information about a provisioned client.
 type ClientRecord struct {
-	// Fingerprint is the SHA-256 hash of the client's certificate (hex-encoded).
-	Fingerprint string `cbor:"1,keyasint"`
+	// Fingerprint is the SHA-256 hash of the client's certificate.
+	Fingerprint qdef.FP `cbor:"1,keyasint"`
 
 	// Hostname is the client's declared hostname from provisioning.
 	Hostname string `cbor:"2,keyasint"`
@@ -53,55 +39,28 @@ type ClientRecord struct {
 	// LastAddr is the client's most recent connection address.
 	// Updated each time the client connects to the server.
 	LastAddr netip.AddrPort `cbor:"6,keyasint"`
+
+	// RequestedRoles is the set of roles the client advertised/requested.
+	// These are stored when the client connects, and used when authorizing.
+	RequestedRoles []string `cbor:"7,keyasint,omitempty"`
+
+	// Online indicates whether the client is currently connected.
+	// Set to true when the client connects, false when it disconnects.
+	Online bool `cbor:"8,keyasint"`
+
+	// LastSeen is when the client was last seen (connect or disconnect time).
+	LastSeen time.Time `cbor:"9,keyasint"`
 }
 
-// AuthManager extends qdef.AuthorizationManager with management capabilities.
-// It provides persistent storage for roles, client records, and authorization mappings.
-type AuthManager interface {
-	qdef.AuthorizationManager
+// ClientFilter specifies criteria for filtering client records.
+type ClientFilter struct {
+	// Fingerprints limits results to clients with these fingerprints.
+	// If empty, no fingerprint filtering is applied.
+	Fingerprints []qdef.FP
 
-	// SetRoleDef creates or updates a role definition.
-	// Roles define what job types a client can provide or send to.
-	SetRoleDef(name string, config RoleConfig) error
-
-	// GetRoleDef retrieves a role definition by name.
-	// Returns the config and true if found, or an empty config and false if not found.
-	GetRoleDef(name string) (RoleConfig, bool)
-
-	// DeleteRoleDef removes a role definition.
-	// Existing client authorizations referencing this role are not automatically updated.
-	DeleteRoleDef(name string) error
-
-	// ListRoleDefs returns all defined roles as a map of name to config.
-	ListRoleDefs() map[string]RoleConfig
-
-	// SetStaticAuthorization assigns roles to a client identified by certificate fingerprint.
-	// This determines what the client is allowed to do after connecting.
-	SetStaticAuthorization(fingerprint string, roles []string) error
-
-	// GetStaticAuthorization retrieves the roles assigned to a client.
-	// Returns nil if the client has no authorizations.
-	GetStaticAuthorization(fingerprint string) []string
-
-	// RemoveStaticAuthorization removes all role assignments for a client.
-	RemoveStaticAuthorization(fingerprint string) error
-
-	// ListAuthorizations returns all client authorizations as a map of fingerprint to roles.
-	ListAuthorizations() map[string][]string
-
-	// SetClientStatus updates a client's authorization status.
-	// Use this to authorize, revoke, or change a client's status.
-	SetClientStatus(fingerprint string, status qdef.ClientStatus) error
-
-	// UpdateClientAddr updates a client's last known connection address.
-	// Call this from a StateListener.OnIdentityConnect handler to track client IPs.
-	UpdateClientAddr(fingerprint string, addr netip.AddrPort) error
-
-	// ListClients returns all client records as a map of fingerprint to record.
-	ListClients() map[string]ClientRecord
-
-	// Close releases resources and stops background goroutines.
-	Close() error
+	// Status limits results to clients with this status.
+	// If nil, no status filtering is applied.
+	Status *qdef.ClientStatus
 }
 
 // AuthManagerConfig configures the AuthManager.
@@ -121,6 +80,11 @@ type AuthManagerConfig struct {
 	// If zero, defaults to DefaultCleanupInterval (6 hours).
 	// Set to a negative value to disable automatic cleanup.
 	CleanupInterval time.Duration
+
+	// BackupInterval is how often to backup the database.
+	// If zero or negative, backup is disabled.
+	// Backups are saved as auth.db.backup next to the active database.
+	BackupInterval time.Duration
 
 	// CACert and CAKey allow injecting an existing CA.
 	// If nil, a new CA is created on first run.

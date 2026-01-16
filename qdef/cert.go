@@ -15,6 +15,8 @@ import (
 	"math/big"
 	"net"
 	"time"
+
+	"golang.org/x/crypto/blake2b"
 )
 
 var (
@@ -36,8 +38,10 @@ func randomSerialNumber() (*big.Int, error) {
 	return new(big.Int).SetBytes(serialBytes), nil
 }
 
+const fpSize = 8
+
 // FP is a certificate fingerprint (SHA-256 hash of the certificate's raw bytes).
-type FP [32]byte
+type FP [fpSize]byte
 
 // String returns the hex-encoded fingerprint.
 func (f FP) String() string {
@@ -56,7 +60,7 @@ func (f FP) MarshalBinary() ([]byte, error) {
 
 // UnmarshalBinary implements encoding.BinaryUnmarshaler for CBOR decoding.
 func (f *FP) UnmarshalBinary(data []byte) error {
-	if len(data) != 32 {
+	if len(data) != fpSize {
 		return FingerprintSizeError{Got: len(data)}
 	}
 	copy(f[:], data)
@@ -73,7 +77,7 @@ func ParseFP(s string) (FP, error) {
 	if err != nil {
 		return fp, fmt.Errorf("qconn: invalid fingerprint hex: %w", err)
 	}
-	if len(b) != 32 {
+	if len(b) != fpSize {
 		return fp, FingerprintSizeError{Got: len(b)}
 	}
 	copy(fp[:], b)
@@ -94,13 +98,16 @@ func FingerprintOf(cert *x509.Certificate) FP {
 	if cert == nil {
 		return FP{}
 	}
-	return sha256.Sum256(cert.Raw)
+	return FingerprintHash(cert.Raw)
 }
 
-// FingerprintHex returns the SHA-256 hash of the certificate's raw bytes as a hex string.
-// Deprecated: Use FingerprintOf(cert).String() instead.
-func FingerprintHex(cert *x509.Certificate) string {
-	return FingerprintOf(cert).String()
+func FingerprintHash(raw []byte) FP {
+	var fp FP
+	h, _ := blake2b.New(fpSize, nil)
+	h.Write(raw)
+	s := h.Sum(nil)
+	copy(fp[:], s)
+	return fp
 }
 
 // EncodeCertPEM converts an x509 certificate to PEM format.
@@ -248,6 +255,53 @@ func GenerateDerivedCA(sharedSecret string) (tls.Certificate, error) {
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
 
 	return tls.X509KeyPair(certPEM, keyPEM)
+}
+
+// ProvisioningServerName returns a deterministic server name derived from the provision token.
+// Both client and server use this to establish a shared TLS server name for provisioning.
+func ProvisioningServerName(token string) string {
+	h := sha256.Sum256([]byte("qconn-provision-sni:" + token))
+	return "provision-" + hex.EncodeToString(h[:8])
+}
+
+// GenerateProvisioningServerCert creates a server certificate signed by the derived CA.
+// The hostname should be from ProvisioningServerName for proper SNI matching.
+func GenerateProvisioningServerCert(ca tls.Certificate, hostname string) (tls.Certificate, error) {
+	caCert, err := x509.ParseCertificate(ca.Certificate[0])
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	caKey := ca.PrivateKey.(*ecdsa.PrivateKey)
+
+	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	serial, err := randomSerialNumber()
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: hostname},
+		DNSNames:     []string{hostname},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour), // Short-lived for provisioning
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+
+	certBytes, err := x509.CreateCertificate(rand.Reader, template, caCert, &privKey.PublicKey, caKey)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	return tls.Certificate{
+		Certificate: [][]byte{certBytes},
+		PrivateKey:  privKey,
+	}, nil
 }
 
 // GenerateProvisioningIdentity creates a fresh leaf certificate signed by the derived CA.

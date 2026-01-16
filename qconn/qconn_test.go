@@ -30,21 +30,21 @@ func assertNoError(t *testing.T, err error) {
 	}
 }
 
-func assertEqual(t *testing.T, expected, actual interface{}) {
+func assertEqual(t *testing.T, expected, actual any) {
 	t.Helper()
 	if !reflect.DeepEqual(expected, actual) {
 		t.Fatalf("values are not equal:\nexpected: %[1]v (%[1]T)\nactual:   %[2]v (%[2]T)", expected, actual)
 	}
 }
 
-func assertNotEqual(t *testing.T, unexpected, actual interface{}) {
+func assertNotEqual(t *testing.T, unexpected, actual any) {
 	t.Helper()
 	if reflect.DeepEqual(unexpected, actual) {
 		t.Fatalf("values should not be equal:\nunexpected: %[1]v (%[1]T)\nactual:     %[2]v (%[2]T)", unexpected, actual)
 	}
 }
 
-func assertNotNil(t *testing.T, v interface{}) {
+func assertNotNil(t *testing.T, v any) {
 	t.Helper()
 	if v == nil || (reflect.ValueOf(v).Kind() == reflect.Ptr && reflect.ValueOf(v).IsNil()) {
 		t.Fatal("expected value to be not nil, but it was")
@@ -53,16 +53,31 @@ func assertNotNil(t *testing.T, v interface{}) {
 
 // --- Test Setup ---
 
-func setupTestInfra(ctx context.Context, t *testing.T) (*qmock.InMemoryAuthorizationManager, *qmock.TestStreamHandler, *qmock.TestStreamHandler, *qmock.TestObserver, *qmock.TestObserver) {
+func setupTestInfra(ctx context.Context, t *testing.T) (*qmock.InMemoryAuthorizationManager, *qmock.TestStreamHandler, *qmock.TestObserver, *qmock.TestObserver) {
 	authManager := qmock.NewInMemoryAuthorizationManager()
-	clientHandler := qmock.NewTestStreamHandler(t)
 	serverHandler := qmock.NewTestStreamHandler(t)
 	serverHandler.Auth = authManager
 
 	clientObs := qmock.NewTestObserver(ctx, t)
 	serverObs := qmock.NewTestObserver(ctx, t)
 
-	return authManager, clientHandler, serverHandler, clientObs, serverObs
+	return authManager, serverHandler, clientObs, serverObs
+}
+
+// waitForState waits for a specific state from the observer.
+func waitForState(t *testing.T, obs *qmock.TestObserver, expected qdef.ClientState, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		select {
+		case state := <-obs.States:
+			if state == expected {
+				return true
+			}
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	return false
 }
 
 // --- Tests ---
@@ -70,8 +85,7 @@ func setupTestInfra(ctx context.Context, t *testing.T) (*qmock.InMemoryAuthoriza
 func TestFullConnectionLifecycle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	authManager, clientHandler, serverHandler, clientObs, serverObs := setupTestInfra(ctx, t)
-	defer clientHandler.Close()
+	authManager, serverHandler, clientObs, serverObs := setupTestInfra(ctx, t)
 	defer serverHandler.Close()
 
 	// 1. Setup Server with dynamic ports.
@@ -84,7 +98,6 @@ func TestFullConnectionLifecycle(t *testing.T) {
 		ListenOn:        "",
 		ProvisionTokens: []string{testProvisionToken},
 		Auth:            authManager,
-		Handler:         serverHandler,
 		Observer:        serverObs,
 	})
 	assertNoError(t, err)
@@ -104,22 +117,20 @@ func TestFullConnectionLifecycle(t *testing.T) {
 		ServerHostname:  testServerHostname,
 		CredentialStore: credStore,
 		Resolver:        resolver,
-		Handler:         clientHandler,
 		Observer:        clientObs,
 	})
 	err = client.Connect(ctx)
 	assertNoError(t, err)
 	defer client.Close()
 
-	select {
-	case <-clientHandler.Connects:
-		t.Log("Test: Client connected. Authorizing now...")
-		provisionedID, _ := credStore.GetIdentity()
-		err = authManager.SetStatus(provisionedID, qdef.StatusAuthorized)
-		assertNoError(t, err)
-	case <-time.After(2 * time.Second):
+	// Wait for client to connect
+	if !waitForState(t, clientObs, qdef.StateConnected, 5*time.Second) {
 		t.Fatal("client did not connect/provision in time")
 	}
+	t.Log("Test: Client connected. Authorizing now...")
+	provisionedID, _ := credStore.GetIdentity()
+	err = authManager.SetStatus(provisionedID, qdef.StatusAuthorized)
+	assertNoError(t, err)
 
 	// 5. Verify bidirectional communication using the high-level Request API.
 	t.Log("Test: Verifying bidirectional communication via Request.")
@@ -147,8 +158,7 @@ func TestFullConnectionLifecycle(t *testing.T) {
 func TestConnectionMigration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	authManager, clientHandler, _, clientObs, _ := setupTestInfra(ctx, t)
-	defer clientHandler.Close()
+	authManager, _, clientObs, _ := setupTestInfra(ctx, t)
 
 	// 1. Setup common certs and TLS configs.
 	id := qdef.Identity{Hostname: testClientHostname}
@@ -166,7 +176,7 @@ func TestConnectionMigration(t *testing.T) {
 	}
 
 	credStore := &qmock.InMemoryCredentialStore{RootCA: authManager.RootCert(), Identity: qdef.Identity{Hostname: testClientHostname}, Token: testProvisionToken}
-	err = credStore.SaveCredentials(qdef.Identity{Hostname: testClientHostname}, clientCertPEM, clientKeyPEM)
+	err = credStore.SaveCredentials(clientCertPEM, clientKeyPEM)
 	assertNoError(t, err)
 
 	// 2. Start a minimal Server A.
@@ -189,19 +199,16 @@ func TestConnectionMigration(t *testing.T) {
 		ServerHostname:  testServerHostname,
 		CredentialStore: credStore,
 		Resolver:        resolver,
-		Handler:         clientHandler,
 		Observer:        clientObs,
 	})
 	err = client.Connect(context.Background())
 	assertNoError(t, err)
 	defer client.Close()
 
-	select {
-	case <-clientHandler.Connects:
-		t.Logf("Client connected to Server A at %s", addrA)
-	case <-time.After(3 * time.Second):
+	if !waitForState(t, clientObs, qdef.StateConnected, 3*time.Second) {
 		t.Fatal("client did not connect to server A")
 	}
+	t.Logf("Client connected to Server A at %s", addrA)
 
 	// 4. Start a minimal Server B.
 	listenerB, err := quic.ListenAddr("127.0.0.1:0", serverTlsConfig, nil)
@@ -213,7 +220,6 @@ func TestConnectionMigration(t *testing.T) {
 		if err != nil {
 			return
 		}
-		clientHandler.Connects <- conn // Signal re-connection.
 		<-conn.Context().Done()
 	}()
 
@@ -232,12 +238,14 @@ func TestConnectionMigration(t *testing.T) {
 	client.mu.Unlock()
 
 	// 7. Wait for the client's monitorConnection to reconnect to Server B.
-	select {
-	case <-clientHandler.Connects:
-		t.Log("Client successfully reconnected to Server B")
-	case <-time.After(10 * time.Second): // Reconnect backoff can take a few seconds.
+	// First wait for disconnect, then reconnect.
+	if !waitForState(t, clientObs, qdef.StateDisconnected, 5*time.Second) {
+		t.Log("Warning: did not see disconnect state")
+	}
+	if !waitForState(t, clientObs, qdef.StateConnected, 10*time.Second) {
 		t.Fatal("client did not reconnect to server B")
 	}
+	t.Log("Client successfully reconnected to Server B")
 
 	// 8. Verify the new connection details.
 	conn := client.Connection()
@@ -251,15 +259,14 @@ func TestConnectionMigration(t *testing.T) {
 func TestSupervisorDNSUpdate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	authManager, clientHandler, _, clientObs, _ := setupTestInfra(ctx, t)
-	defer clientHandler.Close()
+	authManager, _, clientObs, _ := setupTestInfra(ctx, t)
 
 	id := qdef.Identity{Hostname: testClientHostname}
 	clientCertPEM, clientKeyPEM, err := authManager.IssueClientCertificate(&id)
 	assertNoError(t, err)
 
-	credStore := &qmock.InMemoryCredentialStore{RootCA: authManager.RootCert(), Token: testProvisionToken}
-	err = credStore.SaveCredentials(qdef.Identity{Hostname: testClientHostname}, clientCertPEM, clientKeyPEM)
+	credStore := &qmock.InMemoryCredentialStore{RootCA: authManager.RootCert(), Identity: qdef.Identity{Hostname: testClientHostname}, Token: testProvisionToken}
+	err = credStore.SaveCredentials(clientCertPEM, clientKeyPEM)
 	assertNoError(t, err)
 
 	resolver := &qmock.MockResolver{}
@@ -269,7 +276,6 @@ func TestSupervisorDNSUpdate(t *testing.T) {
 		ServerHostname:  testServerHostname,
 		CredentialStore: credStore,
 		Resolver:        resolver,
-		Handler:         clientHandler,
 		Observer:        clientObs,
 		ResolverRefresh: 50 * time.Millisecond,
 		DialTimeout:     100 * time.Millisecond,
@@ -308,26 +314,23 @@ func TestSupervisorDNSUpdate(t *testing.T) {
 	// Actually, supervisor SHOULD probably trigger a reconnect if addr changes.
 
 	// For now, monitorConnection will retry every i seconds.
-	select {
-	case <-clientHandler.Connects:
-		t.Log("Client connected after supervisor DNS update")
-	case <-time.After(10 * time.Second):
+	if !waitForState(t, clientObs, qdef.StateConnected, 10*time.Second) {
 		t.Fatal("client did not connect after DNS update")
 	}
+	t.Log("Client connected after supervisor DNS update")
 }
 
 func TestServerDowntimeRecovery(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	authManager, clientHandler, serverHandler, clientObs, serverObs := setupTestInfra(ctx, t)
-	defer clientHandler.Close()
+	authManager, serverHandler, clientObs, serverObs := setupTestInfra(ctx, t)
 	defer serverHandler.Close()
 	id := qdef.Identity{Hostname: testClientHostname}
 	clientCertPEM, clientKeyPEM, err := authManager.IssueClientCertificate(&id)
 	assertNoError(t, err)
 
-	credStore := &qmock.InMemoryCredentialStore{RootCA: authManager.RootCert(), Token: testProvisionToken}
-	err = credStore.SaveCredentials(qdef.Identity{Hostname: testClientHostname}, clientCertPEM, clientKeyPEM)
+	credStore := &qmock.InMemoryCredentialStore{RootCA: authManager.RootCert(), Identity: qdef.Identity{Hostname: testClientHostname}, Token: testProvisionToken}
+	err = credStore.SaveCredentials(clientCertPEM, clientKeyPEM)
 	assertNoError(t, err)
 
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -341,7 +344,6 @@ func TestServerDowntimeRecovery(t *testing.T) {
 		ServerHostname:  testServerHostname,
 		CredentialStore: credStore,
 		Resolver:        resolver,
-		Handler:         clientHandler,
 		Observer:        clientObs,
 		KeepAlivePeriod: 500 * time.Millisecond,
 	})
@@ -349,7 +351,6 @@ func TestServerDowntimeRecovery(t *testing.T) {
 	// 1. Start Server.
 	server, err := NewServer(ServerOpt{
 		Auth:            authManager,
-		Handler:         serverHandler,
 		Observer:        serverObs,
 		KeepAlivePeriod: 500 * time.Millisecond,
 	})
@@ -364,12 +365,10 @@ func TestServerDowntimeRecovery(t *testing.T) {
 	assertNoError(t, err)
 	defer client.Close()
 
-	select {
-	case <-clientHandler.Connects:
-		t.Log("Initial connection established")
-	case <-time.After(3 * time.Second):
+	if !waitForState(t, clientObs, qdef.StateConnected, 3*time.Second) {
 		t.Fatal("timed out waiting for initial connection")
 	}
+	t.Log("Initial connection established")
 
 	// 3. STOP Server. (Close the packetConn)
 	t.Log("Stopping server...")
@@ -388,27 +387,24 @@ func TestServerDowntimeRecovery(t *testing.T) {
 	assertNoError(t, err)
 
 	// 5. Wait for Client to RECONNECT.
-	select {
-	case <-clientHandler.Connects:
-		t.Log("Client reconnected after server downtime")
-	case <-time.After(10 * time.Second):
+	if !waitForState(t, clientObs, qdef.StateConnected, 10*time.Second) {
 		t.Fatal("client failed to reconnect after server downtime")
 	}
+	t.Log("Client reconnected after server downtime")
 }
 
 func TestContinuousRetries(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	authManager, clientHandler, _, clientObs, _ := setupTestInfra(ctx, t)
-	defer clientHandler.Close()
+	authManager, _, clientObs, _ := setupTestInfra(ctx, t)
 
 	id := qdef.Identity{Hostname: testClientHostname}
 
 	clientCertPEM, clientKeyPEM, err := authManager.IssueClientCertificate(&id)
 	assertNoError(t, err)
 
-	credStore := &qmock.InMemoryCredentialStore{RootCA: authManager.RootCert(), Token: testProvisionToken}
-	err = credStore.SaveCredentials(id, clientCertPEM, clientKeyPEM)
+	credStore := &qmock.InMemoryCredentialStore{RootCA: authManager.RootCert(), Identity: id, Token: testProvisionToken}
+	err = credStore.SaveCredentials(clientCertPEM, clientKeyPEM)
 	assertNoError(t, err)
 
 	// Point to a dead address initially.
@@ -419,7 +415,6 @@ func TestContinuousRetries(t *testing.T) {
 		ServerHostname:  testServerHostname,
 		CredentialStore: credStore,
 		Resolver:        resolver,
-		Handler:         clientHandler,
 		Observer:        clientObs,
 		DialTimeout:     100 * time.Millisecond,
 	})
@@ -449,12 +444,10 @@ func TestContinuousRetries(t *testing.T) {
 	t.Logf("Updated resolver to point to real address: %s", listener.Addr().String())
 
 	// Client should eventually connect due to the supervisor's continuous retry.
-	select {
-	case <-clientHandler.Connects:
-		t.Log("Client connected due to continuous retry logic")
-	case <-time.After(10 * time.Second):
+	if !waitForState(t, clientObs, qdef.StateConnected, 10*time.Second) {
 		t.Fatal("client did not connect after server came online")
 	}
+	t.Log("Client connected due to continuous retry logic")
 }
 
 func TestProvisioningRetry(t *testing.T) {
@@ -495,7 +488,6 @@ func TestProvisioningRetry(t *testing.T) {
 	server, err := NewServer(ServerOpt{
 		Auth:            auth,
 		ProvisionTokens: []string{testProvisionToken},
-		Handler:         serverHandler,
 		Observer:        qmock.NewTestObserver(ctx, t),
 	})
 	if err != nil {
@@ -537,8 +529,7 @@ func TestProvisioningRetry(t *testing.T) {
 func TestClientObserver(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	authManager, clientHandler, _, obs, serverObs := setupTestInfra(ctx, t)
-	defer clientHandler.Close()
+	authManager, _, obs, serverObs := setupTestInfra(ctx, t)
 
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	assertNoError(t, err)
@@ -550,7 +541,6 @@ func TestClientObserver(t *testing.T) {
 	server, err := NewServer(ServerOpt{
 		ProvisionTokens: []string{testProvisionToken},
 		Auth:            authManager,
-		Handler:         serverHandler,
 		Observer:        serverObs,
 	})
 	assertNoError(t, err)
@@ -566,7 +556,6 @@ func TestClientObserver(t *testing.T) {
 		ServerHostname:  testServerHostname,
 		CredentialStore: credStore,
 		Resolver:        resolver,
-		Handler:         clientHandler,
 		Observer:        obs,
 	})
 
@@ -605,7 +594,7 @@ func TestConnectionReliability(t *testing.T) {
 	assertNoError(t, err)
 
 	credStore := &qmock.InMemoryCredentialStore{Identity: id, Token: "test-token", RootCA: auth.RootCert()}
-	err = credStore.SaveCredentials(qdef.Identity{Hostname: testClientHostname}, clientCertPEM, clientKeyPEM)
+	err = credStore.SaveCredentials(clientCertPEM, clientKeyPEM)
 	assertNoError(t, err)
 
 	// Short timeout for fast testing.
@@ -619,7 +608,6 @@ func TestConnectionReliability(t *testing.T) {
 			Auth:            auth,
 			KeepAlivePeriod: 100 * time.Millisecond,
 			Observer:        sObs,
-			Handler:         serverHandler,
 		})
 		assertNoError(t, err)
 		auth.SetStatus(id, qdef.StatusAuthorized)

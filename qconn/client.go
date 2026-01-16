@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,12 +53,14 @@ var clientTransitions = []qstate.Transition[qdef.ClientState]{
 
 // Client implements the resilient QUIC client.
 type Client struct {
-	opt   ClientOpt
-	state *qstate.Machine[qdef.ClientState]
+	opt      ClientOpt
+	state    *qstate.Machine[qdef.ClientState]
+	hostname string
 
 	mu                 sync.RWMutex
 	conn               *quic.Conn
 	identity           qdef.Identity
+	devices            []qdef.DeviceInfo // Rich device info for updates
 	lastAddr           string
 	cancel             context.CancelFunc
 	shutdownWg         sync.WaitGroup
@@ -66,10 +70,28 @@ type Client struct {
 }
 
 type ClientOpt struct {
-	ServerHostname  string
+	// ServerHostname is the server address in "host:port" format.
+	// Used for DNS resolution and connection.
+	ServerHostname string
+
+	// ServerName is the expected TLS server name for certificate verification.
+	// This MUST match the hostname in the server's certificate (CN or SAN).
+	// If empty, defaults to the host portion of ServerHostname.
+	//
+	// Use this when connecting via IP address or localhost but the server
+	// certificate uses a different hostname.
+	ServerName string
+
+	// ClientHostname is the client's hostname used during provisioning.
+	// If empty, falls back to the hostname from CredentialStore.GetIdentity().
+	ClientHostname string
+
+	// Roles are the roles this client requests during provisioning.
+	// These determine what the client is authorized to do once approved.
+	Roles []string
+
 	CredentialStore qdef.CredentialStore
 	Resolver        qdef.Resolver
-	Handler         qdef.StreamHandler
 	ResolverRefresh time.Duration
 	Observer        qdef.ClientObserver
 	KeepAlivePeriod time.Duration
@@ -83,9 +105,16 @@ func NewClient(opt ClientOpt) *Client {
 	if opt.ResolverRefresh == 0 {
 		opt.ResolverRefresh = 5 * time.Minute
 	}
+
+	hostname := opt.ClientHostname
+	if hostname == "" {
+		hostname, _ = os.Hostname()
+	}
+
 	var c *Client
 	c = &Client{
-		opt: opt,
+		opt:      opt,
+		hostname: hostname,
 		state: qstate.New(
 			qdef.StateDisconnected,
 			clientTransitions,
@@ -99,7 +128,7 @@ func NewClient(opt ClientOpt) *Client {
 	return c
 }
 
-func (c *Client) logf(format string, v ...interface{}) {
+func (c *Client) logf(format string, v ...any) {
 	if c.opt.Observer != nil {
 		c.opt.Observer.Logf(c.identity, format, v...)
 	}
@@ -151,6 +180,9 @@ func (c *Client) getTLSConfig() (*tls.Config, error) {
 }
 
 func (c *Client) getServerName() string {
+	if c.opt.ServerName != "" {
+		return c.opt.ServerName
+	}
 	host, _, err := net.SplitHostPort(c.opt.ServerHostname)
 	if err != nil {
 		return c.opt.ServerHostname
@@ -174,15 +206,23 @@ func (c *Client) runProvisioning(ctx context.Context) error {
 		return fmt.Errorf("failed to generate provisioning identity: %w", err)
 	}
 
-	rootCAs, err := c.opt.CredentialStore.GetRootCAs()
+	// During provisioning, use the derived CA to verify the server.
+	// The server must present a certificate signed by the same derived CA.
+	provCACert, err := x509.ParseCertificate(provCA.Certificate[0])
 	if err != nil {
-		return fmt.Errorf("failed to get root CAs: %w", err)
+		return fmt.Errorf("failed to parse provisioning CA: %w", err)
 	}
+	rootCAs := x509.NewCertPool()
+	rootCAs.AddCert(provCACert)
+
+	// Use a deterministic server name derived from the token.
+	// This allows the server to select the correct provisioning certificate.
+	provServerName := qdef.ProvisioningServerName(pt)
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{provCert},
 		RootCAs:      rootCAs,
-		ServerName:   c.getServerName(),
+		ServerName:   provServerName,
 	}
 
 	addr, err := c.opt.Resolver.Resolve(ctx, c.opt.ServerHostname)
@@ -202,22 +242,24 @@ func (c *Client) runProvisioning(ctx context.Context) error {
 	}
 	defer func() { _ = stream.Close() }()
 
-	id, err := c.opt.CredentialStore.GetIdentity()
-	if err != nil {
-		return fmt.Errorf("failed to get identity: %w", err)
-	}
+	// Use roles from ClientOpt (may be nil/empty).
+	roles := c.opt.Roles
 
 	// Generate CSR locally - private key never leaves the client.
-	csrPEM, keyPEM, err := qdef.CreateCSR(id.Hostname)
+	csrPEM, keyPEM, err := qdef.CreateCSR(c.hostname)
 	if err != nil {
 		return fmt.Errorf("failed to create CSR: %w", err)
 	}
 
 	req := qdef.ProvisioningRequest{
-		Hostname: id.Hostname,
+		Hostname: c.hostname,
 		CSRPEM:   csrPEM,
+		Roles:    roles,
 	}
-	rawPayload, _ := cbor.Marshal(req)
+	rawPayload, err := cbor.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("failed to marshal provisioning request: %w", err)
+	}
 	msg := qdef.Message{
 		ID: c.getNextID(),
 		Target: qdef.Addr{
@@ -243,8 +285,15 @@ func (c *Client) runProvisioning(ctx context.Context) error {
 		return fmt.Errorf("failed to unmarshal provisioning payload: %w", err)
 	}
 
+	// Save root CA if provided (for future server verification).
+	if len(payload.RootCAPEM) > 0 {
+		if err := c.opt.CredentialStore.SetRootCA(payload.RootCAPEM); err != nil {
+			return fmt.Errorf("failed to save root CA: %w", err)
+		}
+	}
+
 	// Save credentials with locally-generated private key.
-	if err := c.opt.CredentialStore.SaveCredentials(id, payload.CertPEM, keyPEM); err != nil {
+	if err := c.opt.CredentialStore.SaveCredentials(payload.CertPEM, keyPEM); err != nil {
 		return fmt.Errorf("failed to save credentials: %w", err)
 	}
 
@@ -276,42 +325,51 @@ func (c *Client) runRenewal(ctx context.Context) error {
 	}
 
 	// Save credentials with locally-generated private key.
-	return c.opt.CredentialStore.SaveCredentials(id, payload.CertPEM, keyPEM)
+	return c.opt.CredentialStore.SaveCredentials(payload.CertPEM, keyPEM)
 }
 
-// SetDevices updates the client's internal list of supported device types.
-func (c *Client) SetDevices(devices []string) {
+// SetDevices updates the client's internal list of devices.
+// Each device includes its ID, name, service type, device type, and serial number.
+func (c *Client) SetDevices(devices []qdef.DeviceInfo) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.identity.Devices = devices
+	c.devices = devices
 }
 
+// TriggerUpdateDevices sends the device list to the server.
 func (c *Client) TriggerUpdateDevices(ctx context.Context) error {
 	c.mu.RLock()
-	myDevices := c.identity.Devices
+	devices := c.devices
+	localAddr := c.conn.LocalAddr()
 	c.mu.RUnlock()
-	id, err := c.opt.CredentialStore.GetIdentity()
-	if err != nil {
-		return err
-	}
+
+	addr := localAddr.(*net.UDPAddr).AddrPort().Addr()
+
 	req := qdef.DeviceUpdateRequest{
-		Type:    id.Type,
-		Devices: myDevices,
+		Hostname:  c.hostname,
+		LocalAddr: addr,
+		Devices:   devices,
 	}
 	target := qdef.Addr{
 		Service: qdef.ServiceSystem,
 		Type:    "devices",
 	}
 
-	_, err = c.Request(ctx, target, req, nil)
+	_, err := c.Request(ctx, target, req, nil)
 	if err != nil {
 		return err
+	}
+
+	// Successful device update means the server has authorized client.
+	// Transition to Authorized state if we're currently Connected.
+	if c.state.Current() == qdef.StateConnected {
+		_ = c.state.TransitionTo(qdef.StateAuthorized)
 	}
 	return nil
 }
 
 // Request is a high-level helper that handles ID generation, stream management, and CBOR abstraction.
-func (c *Client) Request(ctx context.Context, target qdef.Addr, payload interface{}, response interface{}) (qdef.MessageID, error) {
+func (c *Client) Request(ctx context.Context, target qdef.Addr, payload any, response any) (qdef.MessageID, error) {
 	c.mu.RLock()
 	conn := c.conn
 	c.mu.RUnlock()
@@ -480,7 +538,9 @@ func (c *Client) supervisor(ctx context.Context) {
 			}
 
 			// Periodic device update.
-			_ = c.TriggerUpdateDevices(ctx)
+			if err := c.TriggerUpdateDevices(ctx); err != nil {
+				c.logf("qconn: TriggerUpdateDevices: %v", err)
+			}
 
 		case <-resolveTicker.C:
 			addr, err := c.opt.Resolver.Resolve(ctx, c.opt.ServerHostname)
@@ -553,12 +613,15 @@ func (c *Client) attemptConnect(ctx context.Context, tlsConfig *tls.Config) {
 	}
 
 	c.conn = conn
+	// Set the identity's address to the server we're connected to.
+	if remoteAddr, err := netip.ParseAddrPort(conn.RemoteAddr().String()); err == nil {
+		c.identity.Address = remoteAddr
+	}
 	c.state.MustTransitionTo(qdef.StateConnected)
 	c.logf("qconn: connection established to %s", c.lastAddr)
-	if c.opt.Handler != nil {
-		go c.opt.Handler.OnConnect(conn)
-		go c.acceptLoop(ctx, conn)
-	}
+
+	// Start accepting incoming streams for bi-directional communication.
+	go c.acceptLoop(ctx, conn)
 }
 
 func (c *Client) acceptLoop(ctx context.Context, conn *quic.Conn) {
@@ -567,7 +630,9 @@ func (c *Client) acceptLoop(ctx context.Context, conn *quic.Conn) {
 		if err != nil {
 			return
 		}
-		go func(stream qdef.Stream) {
+		go func(stream *quic.Stream) {
+			defer func() { _ = stream.Close() }()
+
 			dec := qdef.NewDecoder(stream, 0) // Use default limit for client.
 			var msg qdef.Message
 			if err := dec.Decode(&msg); err != nil {
@@ -577,21 +642,58 @@ func (c *Client) acceptLoop(ctx context.Context, conn *quic.Conn) {
 			id := c.identity
 			c.mu.RUnlock()
 
-			err := c.Router.Dispatch(ctx, id, msg, stream)
-			if err == nil {
-				return
+			// If we receive a request from the server, we must be authorized
+			// (the server only routes to authorized clients).
+			// Transition to Authorized state if needed.
+			if c.state.Current() == qdef.StateConnected {
+				_ = c.state.TransitionTo(qdef.StateAuthorized)
 			}
 
-			// If no handler found, delegate to the stream handler.
-			if errors.Is(err, qdef.ErrNoHandler) {
-				if c.opt.Handler != nil {
-					c.opt.Handler.Handle(ctx, id, msg, stream)
+			// Reject requests if not in an authorized state (e.g., still connecting).
+			if c.state.Current() != qdef.StateAuthorized {
+				errMsg := qdef.Message{
+					ID:    msg.ID,
+					Error: "client not authorized",
 				}
+				_ = cbor.NewEncoder(stream).Encode(errMsg)
 				return
 			}
 
-			// Log dispatch errors.
+			// Helper to send response.
+			sendResponse := func(resp any, respErr error) {
+				var respMsg qdef.Message
+				respMsg.ID = msg.ID
+				if respErr != nil {
+					respMsg.Error = respErr.Error()
+				} else {
+					payload, err := cbor.Marshal(resp)
+					if err != nil {
+						c.logf("failed to marshal response for %s/%s: %v", msg.Target.Service, msg.Target.Type, err)
+						respMsg.Error = fmt.Sprintf("failed to marshal response: %v", err)
+					} else {
+						respMsg.Payload = payload
+					}
+				}
+				if encErr := cbor.NewEncoder(stream).Encode(respMsg); encErr != nil {
+					c.logf("failed to encode response: %v", encErr)
+				}
+			}
+
+			resp, err := c.Router.Dispatch(ctx, id, msg)
+			if err == nil {
+				sendResponse(resp, nil)
+				return
+			}
+
+			// Send error response for unhandled messages.
+			if errors.Is(err, qdef.ErrNoHandler) {
+				sendResponse(nil, fmt.Errorf("no handler for %s:%s", msg.Target.Service, msg.Target.Type))
+				return
+			}
+
+			// Log dispatch errors and send error response.
 			c.logf("dispatch error for %s/%s: %v", msg.Target.Service, msg.Target.Type, err)
+			sendResponse(nil, err)
 		}(stream)
 	}
 }

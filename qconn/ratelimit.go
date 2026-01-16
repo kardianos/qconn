@@ -9,16 +9,16 @@ import (
 // rateLimiter provides atomic rate limiting by key.
 // It prevents the race condition where concurrent requests
 // could both pass the check before either stores the new time.
-type rateLimiter struct {
+type rateLimiter[T comparable] struct {
 	mu       sync.Mutex
 	interval time.Duration
-	times    map[string]time.Time
+	times    map[T]time.Time
 }
 
-func newRateLimiter(ctx context.Context, interval time.Duration) *rateLimiter {
-	r := &rateLimiter{
+func newRateLimiter[T comparable](ctx context.Context, interval time.Duration) *rateLimiter[T] {
+	r := &rateLimiter[T]{
 		interval: interval,
-		times:    make(map[string]time.Time),
+		times:    make(map[T]time.Time),
 	}
 	// Start background cleanup to prevent memory growth.
 	go r.cleanupLoop(ctx)
@@ -26,7 +26,7 @@ func newRateLimiter(ctx context.Context, interval time.Duration) *rateLimiter {
 }
 
 // cleanupLoop periodically removes expired entries.
-func (r *rateLimiter) cleanupLoop(ctx context.Context) {
+func (r *rateLimiter[T]) cleanupLoop(ctx context.Context) {
 	// Clean up at twice the interval rate to ensure timely removal.
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
@@ -45,7 +45,7 @@ func (r *rateLimiter) cleanupLoop(ctx context.Context) {
 // If allowed, it atomically records the current time and returns true.
 // If rate limited, it returns false and the remaining wait time.
 // The check and update are atomic, preventing race conditions.
-func (r *rateLimiter) allow(key string) (allowed bool, remaining time.Duration) {
+func (r *rateLimiter[T]) allow(key T) (allowed bool, remaining time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -63,7 +63,7 @@ func (r *rateLimiter) allow(key string) (allowed bool, remaining time.Duration) 
 // record updates the time for a key without checking.
 // Use this when you want to record a successful operation
 // that should reset the rate limit window.
-func (r *rateLimiter) record(key string) {
+func (r *rateLimiter[T]) record(key T) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.times[key] = time.Now()
@@ -71,7 +71,7 @@ func (r *rateLimiter) record(key string) {
 
 // cleanup removes entries older than the interval.
 // Call periodically to prevent memory growth.
-func (r *rateLimiter) cleanup() {
+func (r *rateLimiter[T]) cleanup() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 

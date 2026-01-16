@@ -3,14 +3,15 @@
 package qmanage
 
 // NewClientStore creates a new file-based credential store.
-func NewClientStore(appName string) (ClientStore, error) {
+func NewClientStore(cfg ClientStoreConfig, appName string) (ClientStore, error) {
 	if err := validateAppName(appName); err != nil {
 		return nil, err
 	}
-	return NewClientStoreWithDir(defaultClientDir(appName))
+	cfg.Dir = defaultClientDir(appName)
+	return newFileCredentialStore(cfg)
 }
 
 // NewClientStoreWithDir creates a new file-based credential store at the specified directory.
-func NewClientStoreWithDir(dir string) (*FileCredentialStore, error) {
-	return newFileCredentialStore(dir)
+func NewClientStoreWithDir(cfg ClientStoreConfig) (*FileCredentialStore, error) {
+	return newFileCredentialStore(cfg)
 }

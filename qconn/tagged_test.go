@@ -38,9 +38,9 @@ func TestTagged(t *testing.T) {
 	msg := MessageA{Field: wantMessage}
 	data, err := em.Marshal(msg) // Produces tagged CBOR: tag 100 + map for MessageA
 
-	// Decode to interface{} and type-assert
+	// Decode to any and type-assert
 	var gotMessageA bool
-	var v interface{}
+	var v any
 	err = dm.Unmarshal(data, &v)
 	switch msg := v.(type) {
 	case MessageA:

@@ -3,7 +3,6 @@ package qmanage
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"os"
@@ -16,8 +15,14 @@ import (
 // FileCredentialStore implements ClientStore using filesystem storage.
 // This is the primary implementation on Unix systems and is also used
 // for testing on Windows.
+//
+// Identity (hostname, roles) and provision token are stored in memory only.
+// Only certificates and keys are persisted to the filesystem.
 type FileCredentialStore struct {
-	dir string
+	dir      string
+	identity qdef.Identity // Hostname and Roles set at init; Fingerprint updated from cert
+	token    string        // Provision token set at init
+
 	mu  sync.RWMutex
 	sig chan struct{}
 }
@@ -25,31 +30,50 @@ type FileCredentialStore struct {
 var _ qdef.CredentialStore = (*FileCredentialStore)(nil)
 var _ ClientStore = (*FileCredentialStore)(nil)
 
-// newFileCredentialStore creates a new file-based credential store at the specified directory.
-func newFileCredentialStore(dir string) (*FileCredentialStore, error) {
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return nil, fmt.Errorf("create client store directory: %w", err)
-	}
-	return &FileCredentialStore{dir: dir}, nil
+// ClientStoreConfig configures a FileCredentialStore.
+type ClientStoreConfig struct {
+	// Dir is the directory to store credentials.
+	Dir string
+
+	// Hostname is the client's hostname for provisioning.
+	Hostname string
+
+	// Roles are the roles this client requests during provisioning.
+	Roles []string
+
+	// ProvisionToken is the initial provisioning token.
+	ProvisionToken string
 }
 
-// GetIdentity returns the stored identity.
+// newFileCredentialStore creates a new file-based credential store.
+func newFileCredentialStore(cfg ClientStoreConfig) (*FileCredentialStore, error) {
+	if err := os.MkdirAll(cfg.Dir, 0700); err != nil {
+		return nil, fmt.Errorf("create client store directory: %w", err)
+	}
+	s := &FileCredentialStore{
+		dir:   cfg.Dir,
+		token: cfg.ProvisionToken,
+		identity: qdef.Identity{
+			Hostname: cfg.Hostname,
+			Roles:    cfg.Roles,
+		},
+	}
+	// Try to load fingerprint from existing certificate.
+	if cert, err := s.GetClientCertificate(); err == nil && len(cert.Certificate) > 0 {
+		if leaf, err := x509.ParseCertificate(cert.Certificate[0]); err == nil {
+			s.identity.Fingerprint = qdef.FingerprintOf(leaf)
+		}
+	}
+	return s, nil
+}
+
+// GetIdentity returns the client identity.
+// Hostname and Roles are set at initialization.
+// Fingerprint is derived from the stored certificate.
 func (s *FileCredentialStore) GetIdentity() (qdef.Identity, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	data, err := os.ReadFile(filepath.Join(s.dir, "identity.json"))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return qdef.Identity{}, nil
-		}
-		return qdef.Identity{}, fmt.Errorf("read identity: %w", err)
-	}
-	var id qdef.Identity
-	if err := json.Unmarshal(data, &id); err != nil {
-		return qdef.Identity{}, fmt.Errorf("unmarshal identity: %w", err)
-	}
-	return id, nil
+	return s.identity, nil
 }
 
 // GetClientCertificate returns the stored client certificate.
@@ -91,8 +115,9 @@ func (s *FileCredentialStore) GetRootCAs() (*x509.CertPool, error) {
 	return pool, nil
 }
 
-// SaveCredentials stores the identity and credentials.
-func (s *FileCredentialStore) SaveCredentials(id qdef.Identity, certPEM, keyPEM []byte) error {
+// SaveCredentials stores the client certificate and private key.
+// Updates the internal fingerprint from the certificate.
+func (s *FileCredentialStore) SaveCredentials(certPEM, keyPEM []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -100,7 +125,7 @@ func (s *FileCredentialStore) SaveCredentials(id qdef.Identity, certPEM, keyPEM 
 		return fmt.Errorf("create directory: %w", err)
 	}
 
-	// Extract and validate fingerprint from certificate.
+	// Extract fingerprint from certificate and update identity.
 	block, _ := pem.Decode(certPEM)
 	if block == nil {
 		return qdef.ErrDecodeCert
@@ -109,16 +134,7 @@ func (s *FileCredentialStore) SaveCredentials(id qdef.Identity, certPEM, keyPEM 
 	if err != nil {
 		return fmt.Errorf("parse certificate: %w", err)
 	}
-	id.Fingerprint = qdef.FingerprintOf(leaf)
-
-	// Write identity.
-	idData, err := json.Marshal(id)
-	if err != nil {
-		return fmt.Errorf("marshal identity: %w", err)
-	}
-	if err := atomicWriteFile(filepath.Join(s.dir, "identity.json"), idData, 0600); err != nil {
-		return fmt.Errorf("write identity: %w", err)
-	}
+	s.identity.Fingerprint = qdef.FingerprintOf(leaf)
 
 	// Write certificate.
 	if err := atomicWriteFile(filepath.Join(s.dir, "client.crt"), certPEM, 0600); err != nil {
@@ -139,16 +155,11 @@ func (s *FileCredentialStore) SaveCredentials(id qdef.Identity, certPEM, keyPEM 
 	return nil
 }
 
-// ProvisionToken returns the stored provision token.
+// ProvisionToken returns the provision token set at initialization.
 func (s *FileCredentialStore) ProvisionToken() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	data, err := os.ReadFile(filepath.Join(s.dir, "token"))
-	if err != nil {
-		return ""
-	}
-	return string(data)
+	return s.token
 }
 
 // OnUpdate returns a channel that is closed when credentials are updated.
@@ -159,17 +170,6 @@ func (s *FileCredentialStore) OnUpdate() <-chan struct{} {
 		s.sig = make(chan struct{})
 	}
 	return s.sig
-}
-
-// SetProvisionToken stores the provision token.
-func (s *FileCredentialStore) SetProvisionToken(token string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if err := os.MkdirAll(s.dir, 0700); err != nil {
-		return fmt.Errorf("create directory: %w", err)
-	}
-	return atomicWriteFile(filepath.Join(s.dir, "token"), []byte(token), 0600)
 }
 
 // SetRootCA stores the root CA certificate.

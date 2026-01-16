@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
-	"github.com/quic-go/quic-go"
 )
 
 // Default CBOR message size limits.
@@ -24,25 +23,47 @@ const (
 	ProvisioningMaxMessageSize = 64 << 10
 )
 
+// decMode is the CBOR decoder mode used throughout the package.
+var decMode cbor.DecMode
+
+func init() {
+	var err error
+	decMode, err = cbor.DecOptions{
+		MaxArrayElements: 1024,
+		MaxMapPairs:      1024,
+		MaxNestedLevels:  32,
+	}.DecModeWithTags(cbor.NewTagSet())
+	if err != nil {
+		panic(fmt.Sprintf("qdef: failed to create CBOR decoder mode: %v", err))
+	}
+}
+
 // NewDecoder creates a CBOR decoder with the specified maximum message size.
 // If maxSize is 0, DefaultMaxMessageSize is used.
 func NewDecoder(r io.Reader, maxSize int) *cbor.Decoder {
 	if maxSize <= 0 {
 		maxSize = DefaultMaxMessageSize
 	}
-	dm, _ := cbor.DecOptions{
-		MaxArrayElements: 1024,
-		MaxMapPairs:      1024,
-		MaxNestedLevels:  32,
-	}.DecModeWithTags(cbor.NewTagSet())
-	return dm.NewDecoder(io.LimitReader(r, int64(maxSize)))
+	return decMode.NewDecoder(io.LimitReader(r, int64(maxSize)))
 }
 
-// StreamHandler defines the application-level logic for handling QUIC streams.
-type StreamHandler interface {
-	RegisterHandlers(r *StreamRouter)
-	Handle(ctx context.Context, id Identity, msg Message, stream Stream)
-	OnConnect(conn *quic.Conn)
+// MessageRouter routes ServiceUser messages to external systems (e.g., gRPC).
+// The server tries local qconn clients first, then delegates to MessageRouter.
+type MessageRouter interface {
+	// RouteMessage routes a message to target. Return ErrNotHandled if not handled.
+	RouteMessage(ctx context.Context, sender Identity, msg Message) (*Message, error)
+
+	// ListTargets returns external targets that can receive messages.
+	// Used by list-clients to include external systems in the client list.
+	ListTargets(filterFP []FP) []ClientInfo
+}
+
+// ConnectionObserver receives connection lifecycle events.
+// Used by bridges to track connected clients.
+type ConnectionObserver interface {
+	OnConnect(id Identity)
+	OnDisconnect(id Identity)
+	OnDeviceUpdate(id Identity, devices []DeviceInfo)
 }
 
 var (
@@ -69,6 +90,9 @@ var (
 
 	// ErrTargetNotFound is returned when the target machine is not connected.
 	ErrTargetNotFound = fmt.Errorf("qconn: target not found")
+
+	// ErrNotHandled is returned by MessageRouter when it doesn't handle a target.
+	ErrNotHandled = fmt.Errorf("qconn: not handled")
 
 	// ErrDecodeCSR is returned when a CSR PEM block cannot be decoded.
 	ErrDecodeCSR = fmt.Errorf("qconn: failed to decode CSR PEM")
@@ -101,7 +125,7 @@ type FingerprintSizeError struct {
 }
 
 func (e FingerprintSizeError) Error() string {
-	return fmt.Sprintf("qconn: fingerprint must be 32 bytes, got %d", e.Got)
+	return fmt.Sprintf("qconn: fingerprint must be %d bytes, got %d", fpSize, e.Got)
 }
 
 // CSRHostnameMismatchError is returned when a CSR's CommonName doesn't match the expected hostname.
@@ -165,7 +189,7 @@ func (e UnauthorizedRoleError) Unwrap() error {
 
 // UnauthorizedTargetError is returned when a target lacks permission to provide a job type.
 type UnauthorizedTargetError struct {
-	Target  string
+	Target  FP
 	JobType string
 }
 
@@ -222,6 +246,23 @@ func (e MachineNotConnectedError) Unwrap() error {
 	return ErrTargetNotFound
 }
 
+// ErrDeviceNotFound is returned when a target device is not found on the machine.
+var ErrDeviceNotFound = fmt.Errorf("qconn: device not found")
+
+// DeviceNotFoundError is returned when a target device is not declared by the machine.
+type DeviceNotFoundError struct {
+	Machine  FP
+	DeviceID string
+}
+
+func (e DeviceNotFoundError) Error() string {
+	return fmt.Sprintf("%s: device %q not found on machine %s", ErrDeviceNotFound, e.DeviceID, e.Machine)
+}
+
+func (e DeviceNotFoundError) Unwrap() error {
+	return ErrDeviceNotFound
+}
+
 // ClientStatus represents the authorization state of a client.
 type ClientStatus int
 
@@ -271,7 +312,7 @@ func (s ClientState) String() string {
 	case StateConnecting:
 		return "connecting"
 	case StateConnected:
-		return "connected"
+		return "connected/not-authorized"
 	case StateAuthorized:
 		return "authorized"
 	case StateRenewing:
@@ -334,9 +375,6 @@ type Identity struct {
 
 	// Roles are the authorization roles assigned to this client (server-side only).
 	Roles []string `cbor:"5,keyasint,omitempty"`
-
-	// Devices are the device types this client provides.
-	Devices []string `cbor:"6,keyasint,omitempty"`
 }
 
 func (id Identity) String() string {
@@ -344,6 +382,12 @@ func (id Identity) String() string {
 		return "unknown"
 	}
 	return fmt.Sprintf("%s (%s, %s)", id.Fingerprint, id.Hostname, id.Address)
+}
+
+// RoleConfig defines what a role can do.
+type RoleConfig struct {
+	Provides []string `cbor:"1,keyasint"` // Job types this role provides.
+	SendsTo  []string `cbor:"2,keyasint"` // Job types this role can send to.
 }
 
 // MessageID is a unique identifier for a message.
@@ -374,7 +418,7 @@ func (s ServiceType) String() string {
 // Addr represents a target in the qconn network.
 type Addr struct {
 	Type    string      `json:"type"`
-	Machine string      `json:"machine"`
+	Machine FP          `json:"machine"`
 	Device  string      `json:"device"`
 	Service ServiceType `json:"service"`
 }
@@ -383,7 +427,7 @@ type Addr struct {
 // This is the most common pattern for inter-client communication.
 //
 // Example: UserAddr("abc123fingerprint", "printer") targets the "printer" handler on machine "abc123fingerprint".
-func UserAddr(machine, jobType string) Addr {
+func UserAddr(machine FP, jobType string) Addr {
 	return Addr{
 		Service: ServiceUser,
 		Machine: machine,
@@ -395,7 +439,7 @@ func UserAddr(machine, jobType string) Addr {
 // Use this when a machine exposes multiple instances of the same job type.
 //
 // Example: DeviceAddr("abc123", "printer", "office-printer-1") targets a specific printer.
-func DeviceAddr(machine, jobType, device string) Addr {
+func DeviceAddr(machine FP, jobType, device string) Addr {
 	return Addr{
 		Service: ServiceUser,
 		Machine: machine,
@@ -424,78 +468,62 @@ type Message struct {
 	Payload cbor.RawMessage `json:"payload"`
 }
 
-// HostState represents the known state of a host.
-type HostState struct {
-	Identity    Identity
-	Online      bool
-	Provisioned bool
-}
-
 // ClientObserver receives lifecycle events and logs.
 type ClientObserver interface {
 	OnStateChange(id Identity, state ClientState)
-	Logf(id Identity, format string, args ...interface{})
+	Logf(id Identity, format string, args ...any)
 }
 
-// StateListener is notified by the server about client connection events.
-// This allows anex to track state without a direct server reference.
-type StateListener interface {
-	OnIdentityConnect(id Identity, conn *quic.Conn)
-	OnIdentityDisconnect(id Identity)
-	OnStateChange(id Identity, state ClientState)
-}
-
-// Stream represents a QUIC stream.
-type Stream interface {
-	io.Reader
-	io.Writer
-	io.Closer
-	Context() context.Context
-}
-
-// GetStatusFromCert is a helper for auth managers (may be moved to an internal package later if needed).
-// AuthorizationManager handles client authorization, role assignment, and certificate issuance.
+// AuthorizationManager handles client authorization and certificate issuance.
 // For Server.
 type AuthorizationManager interface {
-	// GetStatus returns the current authorization status of a client certificate.
-	GetStatus(cert *x509.Certificate) (ClientStatus, error)
+	// GetStatus returns the current authorization status of a client.
+	GetStatus(fp FP) (ClientStatus, error)
 
-	// GetSignal returns a channel that is closed when the authorization status
-	// for the given certificate changes.
-	GetSignal(cert *x509.Certificate) <-chan struct{}
-
-	// AuthorizeRoles filters a list of requested roles for a client during provisioning.
-	// Authorization is by fingerprint only.
-	// Returns the list of permitted roles.
-	AuthorizeRoles(fingerprint string, requested []string) []string
+	// WaitFor blocks until the authorization status changes or context is cancelled.
+	// Returns ctx.Err() on context cancellation, nil if status changed.
+	WaitFor(ctx context.Context, fp FP) error
 
 	// SignProvisioningCSR signs a CSR for initial client provisioning.
 	// The hostname is used for certificate subject; private keys never leave the client.
-	SignProvisioningCSR(csrPEM []byte, hostname string) (certPEM []byte, err error)
+	// The roles are the client's requested roles, stored for later authorization.
+	SignProvisioningCSR(csrPEM []byte, hostname string, roles []string) (certPEM []byte, err error)
 
 	// SignRenewalCSR signs a CSR for certificate renewal.
 	// The fingerprint identifies the existing client being renewed.
-	SignRenewalCSR(csrPEM []byte, fingerprint string) (certPEM []byte, err error)
-
-	// Revoke invalidates the identity, preventing future authorizations or renewals.
-	Revoke(id Identity) error
+	SignRenewalCSR(csrPEM []byte, fp FP) (certPEM []byte, err error)
 
 	// RootCert returns the root CA certificate for the network.
 	RootCert() *x509.Certificate
 
 	// ServerCertificate returns the TLS certificate for the server to use.
 	ServerCertificate() (tls.Certificate, error)
+
+	// UpdateClientAddr updates a client's address, marks them online, and sets hostname if empty.
+	// If offline, addr and hostnames are ignored.
+	UpdateClientAddr(fp FP, online bool, addr netip.AddrPort, hostname string) error
+
+	// SetClientStatus updates a client's status.
+	SetClientStatus(fp FP, status ClientStatus) error
+
+	// ListClientsInfo returns clients as ClientInfo.
+	// If showUnauthorized is false, only authorized clients are returned.
+	// If fingerprints is non-empty, only clients with matching fingerprints are returned.
+	ListClientsInfo(showUnauthorized bool, fingerprints []FP) []ClientInfo
 }
 
-// CredentialResponse contains only the certificate; private keys never leave the client.
+// CredentialResponse contains the certificate and optionally the root CA.
+// Private keys never leave the client.
 type CredentialResponse struct {
-	CertPEM []byte `cbor:"cert_pem"`
+	CertPEM   []byte `cbor:"cert_pem"`
+	RootCAPEM []byte `cbor:"root_ca_pem,omitempty"` // Server's root CA for future verification.
 }
 
 // ProvisioningRequest is sent by clients to request initial credentials.
 type ProvisioningRequest struct {
-	Hostname string `cbor:"hostname"`
-	CSRPEM   []byte `cbor:"csr_pem"`
+	Hostname string   `cbor:"hostname"`
+	CSRPEM   []byte   `cbor:"csr_pem"`
+	Roles    []string `cbor:"roles,omitempty"`
 }
 
 // RenewalRequest is sent by clients to renew their certificate.
@@ -503,19 +531,55 @@ type RenewalRequest struct {
 	CSRPEM []byte `cbor:"csr_pem"`
 }
 
+// DeviceInfo describes a device provided by a client.
+// Used both for device updates from clients and in client listings.
+// A machine can have multiple service types (e.g., "printer" and "import-results"),
+// and each device specifies which service type it belongs to.
+type DeviceInfo struct {
+	ID           string    `cbor:"id"`            // Unique device identifier (e.g., "P1")
+	Name         string    `cbor:"name"`          // Human-readable name
+	ServiceType  string    `cbor:"service_type"`  // Service type (e.g., "printer", "import-results")
+	DeviceType   string    `cbor:"device_type"`   // Device subtype (e.g., "network", "usb")
+	SerialNumber string    `cbor:"serial_number"` // Hardware serial number
+	Online       bool      `cbor:"online"`        // Whether device is currently online
+	LastSeen     time.Time `cbor:"last_seen"`     // When device was last seen
+}
+
+// DeviceUpdateRequest sends the complete list of devices for a machine.
+// Each device specifies its service type, allowing a machine to provide
+// multiple service types (e.g., printer and import-results).
 type DeviceUpdateRequest struct {
-	Type    string   `cbor:"type"`
-	Devices []string `cbor:"devices"`
+	Devices   []DeviceInfo `cbor:"devices"` // All devices with their service types
+	Hostname  string       // Hostname.
+	LocalAddr netip.Addr   // Local address in case client is behind a NAT for local identification.
 }
 
 // CredentialStore handles the persistence of client credentials.
-// For Client.
+// Identity (hostname, roles) and provision token are set at initialization.
+// Only certificates and keys are persisted to storage.
 type CredentialStore interface {
+	// GetIdentity returns the client identity.
+	// Hostname and Roles are set at initialization.
+	// Fingerprint is derived from the stored certificate (zero if no cert).
 	GetIdentity() (Identity, error)
+
+	// GetClientCertificate returns the stored client certificate and key.
 	GetClientCertificate() (tls.Certificate, error)
+
+	// GetRootCAs returns the root CA certificate pool for server verification.
 	GetRootCAs() (*x509.CertPool, error)
-	SaveCredentials(id Identity, certPEM, keyPEM []byte) error
+
+	// SetRootCA stores the root CA certificate (received during provisioning).
+	SetRootCA(certPEM []byte) error
+
+	// SaveCredentials stores the client certificate and private key.
+	// The fingerprint in GetIdentity() will be updated from this certificate.
+	SaveCredentials(certPEM, keyPEM []byte) error
+
+	// ProvisionToken returns the provision token set at initialization.
 	ProvisionToken() string
+
+	// OnUpdate returns a channel that is closed when credentials are updated.
 	OnUpdate() <-chan struct{}
 }
 

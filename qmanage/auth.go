@@ -1,10 +1,12 @@
 package qmanage
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
@@ -18,11 +20,10 @@ import (
 )
 
 var (
-	bucketConfig         = []byte("config")
-	bucketServerCert     = []byte("server_cert")
-	bucketClients        = []byte("clients")
-	bucketRoles          = []byte("roles")
-	bucketAuthorizations = []byte("authorizations")
+	bucketConfig     = []byte("config")
+	bucketServerCert = []byte("server_cert")
+	bucketClients    = []byte("clients")
+	bucketRoles      = []byte("roles")
 
 	keyCAC     = []byte("ca_cert_pem")
 	keyCAK     = []byte("ca_key_pem")
@@ -41,20 +42,24 @@ const DefaultCleanupInterval = 6 * time.Hour
 // encryption (e.g., LUKS, BitLocker) or encrypting the data directory.
 type BoltAuthManager struct {
 	db             *bbolt.DB
+	dbPath         string
 	caCert         *x509.Certificate
 	caKey          *ecdsa.PrivateKey
 	serverCert     *tls.Certificate
 	serverHostname string
 
 	mu      sync.RWMutex
-	signals map[string]chan struct{}
+	signals map[qdef.FP]chan struct{}
 
 	// Cleanup goroutine control.
 	cleanupStop chan struct{}
 	cleanupDone chan struct{}
+
+	// Backup goroutine control.
+	backupStop chan struct{}
+	backupDone chan struct{}
 }
 
-var _ AuthManager = (*BoltAuthManager)(nil)
 var _ qdef.AuthorizationManager = (*BoltAuthManager)(nil)
 
 // NewAuthManager creates a new AuthManager with bbolt storage.
@@ -80,8 +85,9 @@ func NewAuthManager(cfg AuthManagerConfig) (*BoltAuthManager, error) {
 
 	m := &BoltAuthManager{
 		db:             db,
+		dbPath:         dbPath,
 		serverHostname: cfg.ServerHostname,
-		signals:        make(map[string]chan struct{}),
+		signals:        make(map[qdef.FP]chan struct{}),
 	}
 
 	if m.serverHostname == "" {
@@ -93,7 +99,7 @@ func NewAuthManager(cfg AuthManagerConfig) (*BoltAuthManager, error) {
 
 	// Create buckets.
 	err = db.Update(func(tx *bbolt.Tx) error {
-		for _, bucket := range [][]byte{bucketConfig, bucketServerCert, bucketClients, bucketRoles, bucketAuthorizations} {
+		for _, bucket := range [][]byte{bucketConfig, bucketServerCert, bucketClients, bucketRoles} {
 			if _, err := tx.CreateBucketIfNotExists(bucket); err != nil {
 				return err
 			}
@@ -129,6 +135,13 @@ func NewAuthManager(cfg AuthManagerConfig) (*BoltAuthManager, error) {
 		m.cleanupStop = make(chan struct{})
 		m.cleanupDone = make(chan struct{})
 		go m.cleanupLoop(cleanupInterval)
+	}
+
+	// Start backup goroutine if enabled.
+	if cfg.BackupInterval > 0 {
+		m.backupStop = make(chan struct{})
+		m.backupDone = make(chan struct{})
+		go m.backupLoop(cfg.BackupInterval)
 	}
 
 	return m, nil
@@ -203,13 +216,11 @@ func (m *BoltAuthManager) saveCA() error {
 
 // GetStatus returns the authorization status of a client.
 // Returns StatusRevoked if the client's certificate has expired.
-func (m *BoltAuthManager) GetStatus(cert *x509.Certificate) (qdef.ClientStatus, error) {
-	fp := qdef.FingerprintHex(cert)
-
+func (m *BoltAuthManager) GetStatus(fp qdef.FP) (qdef.ClientStatus, error) {
 	var status qdef.ClientStatus
 	err := m.db.View(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketClients)
-		data := b.Get([]byte(fp))
+		data := b.Get(fp[:])
 		if data == nil {
 			status = qdef.StatusUnprovisioned
 			return nil
@@ -229,21 +240,26 @@ func (m *BoltAuthManager) GetStatus(cert *x509.Certificate) (qdef.ClientStatus, 
 	return status, err
 }
 
-// GetSignal returns a channel that is closed when the client's status changes.
-func (m *BoltAuthManager) GetSignal(cert *x509.Certificate) <-chan struct{} {
-	fp := qdef.FingerprintHex(cert)
+// WaitFor blocks until the authorization status changes or context is cancelled.
+// Returns ctx.Err() on context cancellation, nil if status changed.
+func (m *BoltAuthManager) WaitFor(ctx context.Context, fp qdef.FP) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	sig, ok := m.signals[fp]
 	if !ok {
 		sig = make(chan struct{})
 		m.signals[fp] = sig
 	}
-	return sig
+	m.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-sig:
+		return nil
+	}
 }
 
-func (m *BoltAuthManager) triggerSignal(fp string) {
+func (m *BoltAuthManager) triggerSignal(fp qdef.FP) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if sig, ok := m.signals[fp]; ok {
@@ -253,35 +269,14 @@ func (m *BoltAuthManager) triggerSignal(fp string) {
 }
 
 // cleanupSignal removes a signal channel for a fingerprint without triggering it.
-func (m *BoltAuthManager) cleanupSignal(fp string) {
+func (m *BoltAuthManager) cleanupSignal(fp qdef.FP) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.signals, fp)
 }
 
-// AuthorizeRoles filters requested roles based on static authorization.
-func (m *BoltAuthManager) AuthorizeRoles(fingerprint string, requested []string) []string {
-	allowed := m.GetStaticAuthorization(fingerprint)
-	if len(allowed) == 0 {
-		return nil
-	}
-
-	allowedMap := make(map[string]bool)
-	for _, r := range allowed {
-		allowedMap[r] = true
-	}
-
-	var authorized []string
-	for _, req := range requested {
-		if allowedMap[req] {
-			authorized = append(authorized, req)
-		}
-	}
-	return authorized
-}
-
 // SignProvisioningCSR signs a CSR for initial provisioning.
-func (m *BoltAuthManager) SignProvisioningCSR(csrPEM []byte, hostname string) ([]byte, error) {
+func (m *BoltAuthManager) SignProvisioningCSR(csrPEM []byte, hostname string, roles []string) ([]byte, error) {
 	certPEM, err := qdef.SignCSRWithValidation(m.caCert, m.caKey, csrPEM, hostname, false)
 	if err != nil {
 		return nil, err
@@ -296,15 +291,16 @@ func (m *BoltAuthManager) SignProvisioningCSR(csrPEM []byte, hostname string) ([
 	if err != nil {
 		return nil, fmt.Errorf("parse signed cert: %w", err)
 	}
-	fp := qdef.FingerprintHex(leaf)
+	fp := qdef.FingerprintOf(leaf)
 
 	// Store client record.
 	rec := ClientRecord{
-		Fingerprint: fp,
-		Hostname:    hostname,
-		Status:      qdef.StatusUnauthorized,
-		CreatedAt:   time.Now(),
-		ExpiresAt:   leaf.NotAfter,
+		Fingerprint:    fp,
+		Hostname:       hostname,
+		Status:         qdef.StatusUnauthorized,
+		RequestedRoles: roles,
+		CreatedAt:      time.Now(),
+		ExpiresAt:      leaf.NotAfter,
 	}
 
 	err = m.db.Update(func(tx *bbolt.Tx) error {
@@ -313,7 +309,7 @@ func (m *BoltAuthManager) SignProvisioningCSR(csrPEM []byte, hostname string) ([
 		if err != nil {
 			return err
 		}
-		return b.Put([]byte(fp), data)
+		return b.Put(fp[:], data)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("store client record: %w", err)
@@ -325,12 +321,12 @@ func (m *BoltAuthManager) SignProvisioningCSR(csrPEM []byte, hostname string) ([
 
 // SignRenewalCSR signs a CSR for certificate renewal.
 // The hostname is validated against the original client record to prevent identity changes.
-func (m *BoltAuthManager) SignRenewalCSR(csrPEM []byte, fingerprint string) ([]byte, error) {
+func (m *BoltAuthManager) SignRenewalCSR(csrPEM []byte, fp qdef.FP) ([]byte, error) {
 	// Load existing client record.
 	var oldRec ClientRecord
 	err := m.db.View(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketClients)
-		data := b.Get([]byte(fingerprint))
+		data := b.Get(fp[:])
 		if data == nil {
 			return qdef.ErrUnknownClient
 		}
@@ -359,23 +355,23 @@ func (m *BoltAuthManager) SignRenewalCSR(csrPEM []byte, fingerprint string) ([]b
 	if err != nil {
 		return nil, fmt.Errorf("parse signed cert: %w", err)
 	}
-	newFP := qdef.FingerprintHex(leaf)
+	newFP := qdef.FingerprintOf(leaf)
 
-	// Update client record: delete old, create new with same status.
+	// Update client record: delete old, create new with same status and roles.
 	newRec := ClientRecord{
-		Fingerprint: newFP,
-		Hostname:    oldRec.Hostname,
-		Status:      oldRec.Status,
-		CreatedAt:   oldRec.CreatedAt,
-		ExpiresAt:   leaf.NotAfter,
+		Fingerprint:    newFP,
+		Hostname:       oldRec.Hostname,
+		Status:         oldRec.Status,
+		RequestedRoles: oldRec.RequestedRoles,
+		CreatedAt:      oldRec.CreatedAt,
+		ExpiresAt:      leaf.NotAfter,
 	}
 
 	err = m.db.Update(func(tx *bbolt.Tx) error {
 		clients := tx.Bucket(bucketClients)
-		auths := tx.Bucket(bucketAuthorizations)
 
 		// Delete old fingerprint.
-		if err := clients.Delete([]byte(fingerprint)); err != nil {
+		if err := clients.Delete(fp[:]); err != nil {
 			return err
 		}
 
@@ -384,39 +380,16 @@ func (m *BoltAuthManager) SignRenewalCSR(csrPEM []byte, fingerprint string) ([]b
 		if err != nil {
 			return err
 		}
-		if err := clients.Put([]byte(newFP), data); err != nil {
-			return err
-		}
-
-		// Migrate authorizations.
-		oldAuth := auths.Get([]byte(fingerprint))
-		if oldAuth != nil {
-			if err := auths.Delete([]byte(fingerprint)); err != nil {
-				return err
-			}
-			if err := auths.Put([]byte(newFP), oldAuth); err != nil {
-				return err
-			}
-		}
-
-		return nil
+		return clients.Put(newFP[:], data)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("update client record: %w", err)
 	}
 
 	// Clean up old fingerprint's signal channel (if any).
-	m.cleanupSignal(fingerprint)
+	m.cleanupSignal(fp)
 	m.triggerSignal(newFP)
 	return certPEM, nil
-}
-
-// Revoke marks a client as revoked.
-func (m *BoltAuthManager) Revoke(id qdef.Identity) error {
-	if id.Fingerprint.IsZero() {
-		return qdef.ErrFingerprintEmpty
-	}
-	return m.SetClientStatus(id.Fingerprint.String(), qdef.StatusRevoked)
 }
 
 // RootCert returns the root CA certificate.
@@ -488,140 +461,18 @@ func (m *BoltAuthManager) ServerCertificate() (tls.Certificate, error) {
 	return cert, nil
 }
 
-// SetRoleDef stores a role definition.
-func (m *BoltAuthManager) SetRoleDef(name string, config RoleConfig) error {
-	return m.db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketRoles)
-		data, err := cbor.Marshal(config)
-		if err != nil {
-			return err
-		}
-		return b.Put([]byte(name), data)
-	})
-}
-
-// GetRoleDef retrieves a role definition.
-// Returns (config, true) if found, (RoleConfig{}, false) if not found or on error.
-func (m *BoltAuthManager) GetRoleDef(name string) (RoleConfig, bool) {
-	var config RoleConfig
-	var found bool
-	err := m.db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketRoles)
-		data := b.Get([]byte(name))
-		if data == nil {
-			return nil
-		}
-		if err := cbor.Unmarshal(data, &config); err != nil {
-			return err
-		}
-		found = true
-		return nil
-	})
-	if err != nil {
-		return RoleConfig{}, false
-	}
-	return config, found
-}
-
-// DeleteRoleDef removes a role definition.
-func (m *BoltAuthManager) DeleteRoleDef(name string) error {
-	return m.db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketRoles)
-		return b.Delete([]byte(name))
-	})
-}
-
-// ListRoleDefs returns all role definitions.
-// Returns an empty map if an error occurs during iteration.
-func (m *BoltAuthManager) ListRoleDefs() map[string]RoleConfig {
-	result := make(map[string]RoleConfig)
-	err := m.db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketRoles)
-		return b.ForEach(func(k, v []byte) error {
-			var config RoleConfig
-			if err := cbor.Unmarshal(v, &config); err != nil {
-				// Skip corrupted entries but continue iteration.
-				return nil
-			}
-			result[string(k)] = config
-			return nil
-		})
-	})
-	if err != nil {
-		return make(map[string]RoleConfig)
-	}
-	return result
-}
-
-// SetStaticAuthorization sets the roles for a client.
-func (m *BoltAuthManager) SetStaticAuthorization(fingerprint string, roles []string) error {
-	return m.db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketAuthorizations)
-		data, err := cbor.Marshal(roles)
-		if err != nil {
-			return err
-		}
-		return b.Put([]byte(fingerprint), data)
-	})
-}
-
-// GetStaticAuthorization retrieves the roles for a client.
-// Returns nil if the client has no authorizations or on error.
-func (m *BoltAuthManager) GetStaticAuthorization(fingerprint string) []string {
-	var roles []string
-	err := m.db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketAuthorizations)
-		data := b.Get([]byte(fingerprint))
-		if data == nil {
-			return nil
-		}
-		return cbor.Unmarshal(data, &roles)
-	})
-	if err != nil {
-		return nil
-	}
-	return roles
-}
-
-// RemoveStaticAuthorization removes roles for a client.
-func (m *BoltAuthManager) RemoveStaticAuthorization(fingerprint string) error {
-	return m.db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketAuthorizations)
-		return b.Delete([]byte(fingerprint))
-	})
-}
-
-// ListAuthorizations returns all client authorizations.
-// Returns an empty map if an error occurs during iteration.
-func (m *BoltAuthManager) ListAuthorizations() map[string][]string {
-	result := make(map[string][]string)
-	err := m.db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketAuthorizations)
-		return b.ForEach(func(k, v []byte) error {
-			var roles []string
-			if err := cbor.Unmarshal(v, &roles); err != nil {
-				// Skip corrupted entries but continue iteration.
-				return nil
-			}
-			result[string(k)] = roles
-			return nil
-		})
-	})
-	if err != nil {
-		return make(map[string][]string)
-	}
-	return result
-}
-
 // SetClientStatus updates a client's status.
-func (m *BoltAuthManager) SetClientStatus(fingerprint string, status qdef.ClientStatus) error {
+func (m *BoltAuthManager) SetClientStatus(fp qdef.FP, status qdef.ClientStatus) error {
+	if fp.IsZero() {
+		return errors.New("missing fingerprint to set client status")
+	}
 	err := m.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketClients)
-		data := b.Get([]byte(fingerprint))
+		data := b.Get(fp[:])
 		if data == nil {
 			// Create new record if it doesn't exist.
 			rec := ClientRecord{
-				Fingerprint: fingerprint,
+				Fingerprint: fp,
 				Status:      status,
 				CreatedAt:   time.Now(),
 			}
@@ -629,7 +480,7 @@ func (m *BoltAuthManager) SetClientStatus(fingerprint string, status qdef.Client
 			if err != nil {
 				return err
 			}
-			return b.Put([]byte(fingerprint), data)
+			return b.Put(fp[:], data)
 		}
 
 		var rec ClientRecord
@@ -641,85 +492,194 @@ func (m *BoltAuthManager) SetClientStatus(fingerprint string, status qdef.Client
 		if err != nil {
 			return err
 		}
-		return b.Put([]byte(fingerprint), newData)
+		return b.Put(fp[:], newData)
 	})
 	if err != nil {
 		return err
 	}
-	m.triggerSignal(fingerprint)
+	m.triggerSignal(fp)
 	return nil
 }
 
-// UpdateClientAddr updates a client's last known connection address.
-// This should be called when a client connects to track their IP address.
-func (m *BoltAuthManager) UpdateClientAddr(fingerprint string, addr netip.AddrPort) error {
+// UpdateClientAddr updates a client's connection info when they connect.
+// Sets the address, marks them as online, updates LastSeen, and sets hostname if empty.
+// If no record exists, creates one with the provided hostname.
+func (m *BoltAuthManager) UpdateClientAddr(fp qdef.FP, online bool, addr netip.AddrPort, hostname string) error {
+	now := time.Now()
 	return m.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketClients)
-		data := b.Get([]byte(fingerprint))
-		if data == nil {
-			return qdef.ErrUnknownClient
-		}
+		data := b.Get(fp[:])
 
 		var rec ClientRecord
-		if err := cbor.Unmarshal(data, &rec); err != nil {
-			return fmt.Errorf("unmarshal client record: %w", err)
+		if data == nil {
+			// Create new record for client connecting without prior provisioning.
+			rec = ClientRecord{
+				Fingerprint: fp,
+				Hostname:    hostname,
+				Status:      qdef.StatusUnauthorized,
+				CreatedAt:   now,
+				LastAddr:    addr,
+				Online:      online,
+				LastSeen:    now,
+			}
+		} else {
+			if err := cbor.Unmarshal(data, &rec); err != nil {
+				return fmt.Errorf("unmarshal client record: %w", err)
+			}
+			rec.LastAddr = addr
+			rec.Online = online
+			rec.LastSeen = now
+			if rec.Hostname == "" && hostname != "" {
+				rec.Hostname = hostname
+			}
 		}
-		rec.LastAddr = addr
+
 		newData, err := cbor.Marshal(rec)
 		if err != nil {
 			return err
 		}
-		return b.Put([]byte(fingerprint), newData)
+		return b.Put(fp[:], newData)
 	})
 }
 
-// ListClients returns all client records.
+// ClearAllOnline marks all clients as offline.
+// Call this on server startup to clear stale online status from previous runs.
+func (m *BoltAuthManager) ClearAllOnline() error {
+	return m.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(bucketClients)
+		return b.ForEach(func(k, v []byte) error {
+			var rec ClientRecord
+			if err := cbor.Unmarshal(v, &rec); err != nil {
+				return nil // Skip corrupted records.
+			}
+			if !rec.Online {
+				return nil // Already offline.
+			}
+			rec.Online = false
+			newData, err := cbor.Marshal(rec)
+			if err != nil {
+				return err
+			}
+			return b.Put(k, newData)
+		})
+	})
+}
+
+// ListClients returns client records matching the filter criteria.
+// Pass an empty filter to return all clients.
 // Returns an empty map if an error occurs during iteration.
-func (m *BoltAuthManager) ListClients() map[string]ClientRecord {
-	result := make(map[string]ClientRecord)
+func (m *BoltAuthManager) ListClients(filter ClientFilter) map[qdef.FP]ClientRecord {
+	result := make(map[qdef.FP]ClientRecord)
 	err := m.db.View(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketClients)
+
+		// If fingerprints specified, do direct lookups instead of iterating all.
+		if len(filter.Fingerprints) > 0 {
+			for _, fp := range filter.Fingerprints {
+				v := b.Get(fp[:])
+				if v == nil {
+					continue
+				}
+				var rec ClientRecord
+				if err := cbor.Unmarshal(v, &rec); err != nil {
+					continue
+				}
+				// Filter by status if specified.
+				if filter.Status != nil && rec.Status != *filter.Status {
+					continue
+				}
+				result[fp] = rec
+			}
+			return nil
+		}
+
+		// No fingerprint filter, iterate all clients.
 		return b.ForEach(func(k, v []byte) error {
 			var rec ClientRecord
 			if err := cbor.Unmarshal(v, &rec); err != nil {
 				// Skip corrupted entries but continue iteration.
 				return nil
 			}
-			result[string(k)] = rec
+
+			// Filter by status if specified.
+			if filter.Status != nil && rec.Status != *filter.Status {
+				return nil
+			}
+
+			var fp qdef.FP
+			copy(fp[:], k)
+			result[fp] = rec
 			return nil
 		})
 	})
 	if err != nil {
-		return make(map[string]ClientRecord)
+		return make(map[qdef.FP]ClientRecord)
 	}
 	return result
 }
 
-// DeleteClient removes a client record and its authorizations.
+// ListClientsInfo returns clients as ClientInfo slice (implements AuthorizationManager).
+// If fingerprints is non-empty, only clients with matching fingerprints are returned.
+func (m *BoltAuthManager) ListClientsInfo(showUnauthorized bool, fingerprints []qdef.FP) []qdef.ClientInfo {
+	filter := ClientFilter{Fingerprints: fingerprints}
+	if !showUnauthorized {
+		status := qdef.StatusAuthorized
+		filter.Status = &status
+	}
+
+	records := m.ListClients(filter)
+	result := make([]qdef.ClientInfo, 0, len(records))
+
+	for fp, rec := range records {
+		// Roles are the client's requested roles if they're authorized.
+		var roles []string
+		if rec.Status == qdef.StatusAuthorized {
+			roles = rec.RequestedRoles
+		}
+
+		info := qdef.ClientInfo{
+			Fingerprint:    fp,
+			Hostname:       rec.Hostname,
+			Status:         rec.Status,
+			Authorized:     rec.Status == qdef.StatusAuthorized,
+			CreatedAt:      rec.CreatedAt,
+			ExpiresAt:      rec.ExpiresAt,
+			LastAddr:       rec.LastAddr,
+			Roles:          roles,
+			RequestedRoles: rec.RequestedRoles,
+			Online:         rec.Online,
+			LastSeen:       rec.LastSeen,
+		}
+		result = append(result, info)
+	}
+
+	return result
+}
+
+// DeleteClient removes a client record.
 // Also cleans up any signal channels associated with the client.
-func (m *BoltAuthManager) DeleteClient(fingerprint string) error {
+func (m *BoltAuthManager) DeleteClient(fp qdef.FP) error {
 	err := m.db.Update(func(tx *bbolt.Tx) error {
 		clients := tx.Bucket(bucketClients)
-		auths := tx.Bucket(bucketAuthorizations)
-
-		if err := clients.Delete([]byte(fingerprint)); err != nil {
-			return err
-		}
-		return auths.Delete([]byte(fingerprint))
+		return clients.Delete(fp[:])
 	})
 	if err != nil {
 		return err
 	}
 	// Clean up signal channel.
-	m.cleanupSignal(fingerprint)
+	m.cleanupSignal(fp)
 	return nil
 }
 
-// Close releases resources and stops the cleanup goroutine.
+// Close releases resources and stops background goroutines.
 func (m *BoltAuthManager) Close() error {
 	if m.cleanupStop != nil {
 		close(m.cleanupStop)
 		<-m.cleanupDone
+	}
+	if m.backupStop != nil {
+		close(m.backupStop)
+		<-m.backupDone
 	}
 	return m.db.Close()
 }
@@ -735,21 +695,21 @@ func (m *BoltAuthManager) cleanupLoop(interval time.Duration) {
 		case <-m.cleanupStop:
 			return
 		case <-ticker.C:
-			m.CleanupExpiredClients()
+			_, _ = m.CleanupExpiredClients()
 		}
 	}
 }
 
-// CleanupExpiredClients removes client records and authorizations for certificates
-// that have expired. This prevents the revocation list from growing indefinitely.
-// Returns the number of clients removed.
-func (m *BoltAuthManager) CleanupExpiredClients() int {
+// CleanupExpiredClients removes client records for certificates
+// that have expired. This prevents the database from growing indefinitely.
+// Returns the number of clients removed and any database error encountered.
+func (m *BoltAuthManager) CleanupExpiredClients() (int, error) {
 	now := time.Now()
 	var removed int
 
 	// Collect expired fingerprints.
-	var expiredFPs []string
-	_ = m.db.View(func(tx *bbolt.Tx) error {
+	var expiredFPs []qdef.FP
+	err := m.db.View(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketClients)
 		return b.ForEach(func(k, v []byte) error {
 			var rec ClientRecord
@@ -757,37 +717,42 @@ func (m *BoltAuthManager) CleanupExpiredClients() int {
 				return nil // Skip corrupted records.
 			}
 			if !rec.ExpiresAt.IsZero() && now.After(rec.ExpiresAt) {
-				expiredFPs = append(expiredFPs, string(k))
+				var fp qdef.FP
+				copy(fp[:], k)
+				expiredFPs = append(expiredFPs, fp)
 			}
 			return nil
 		})
 	})
+	if err != nil {
+		return 0, fmt.Errorf("scan expired clients: %w", err)
+	}
 
 	if len(expiredFPs) == 0 {
-		return 0
+		return 0, nil
 	}
 
 	// Delete expired records.
-	_ = m.db.Update(func(tx *bbolt.Tx) error {
+	err = m.db.Update(func(tx *bbolt.Tx) error {
 		clients := tx.Bucket(bucketClients)
-		auths := tx.Bucket(bucketAuthorizations)
 
 		for _, fp := range expiredFPs {
-			if err := clients.Delete([]byte(fp)); err == nil {
+			if err := clients.Delete(fp[:]); err == nil {
 				removed++
 			}
-			// Also remove any authorizations for this fingerprint.
-			_ = auths.Delete([]byte(fp))
 		}
 		return nil
 	})
+	if err != nil {
+		return removed, fmt.Errorf("delete expired clients: %w", err)
+	}
 
 	// Clean up signal channels.
 	for _, fp := range expiredFPs {
 		m.cleanupSignal(fp)
 	}
 
-	return removed
+	return removed, nil
 }
 
 // RootCertPEM returns the root CA certificate in PEM format.
@@ -797,10 +762,10 @@ func (m *BoltAuthManager) RootCertPEM() []byte {
 
 // SetClientExpiry updates a client's expiration time.
 // This is primarily useful for testing cleanup behavior.
-func (m *BoltAuthManager) SetClientExpiry(fingerprint string, expiresAt time.Time) error {
+func (m *BoltAuthManager) SetClientExpiry(fp qdef.FP, expiresAt time.Time) error {
 	return m.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketClients)
-		data := b.Get([]byte(fingerprint))
+		data := b.Get(fp[:])
 		if data == nil {
 			return qdef.ErrUnknownClient
 		}
@@ -814,6 +779,61 @@ func (m *BoltAuthManager) SetClientExpiry(fingerprint string, expiresAt time.Tim
 		if err != nil {
 			return err
 		}
-		return b.Put([]byte(fingerprint), newData)
+		return b.Put(fp[:], newData)
 	})
+}
+
+// backupLoop periodically backs up the database.
+func (m *BoltAuthManager) backupLoop(interval time.Duration) {
+	defer close(m.backupDone)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-m.backupStop:
+			return
+		case <-ticker.C:
+			m.Backup()
+		}
+	}
+}
+
+// Backup creates a backup of the database.
+// The backup is written to auth.db.backup next to the active database.
+// Returns an error if the backup fails.
+func (m *BoltAuthManager) Backup() error {
+	backupPath := m.dbPath + ".backup"
+	tmpPath := backupPath + ".tmp"
+
+	// Write to temp file first, then rename for atomicity.
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("create backup file: %w", err)
+	}
+	defer os.Remove(tmpPath)
+
+	err = m.db.View(func(tx *bbolt.Tx) error {
+		_, err := tx.WriteTo(f)
+		return err
+	})
+	if err != nil {
+		f.Close()
+		return fmt.Errorf("write backup: %w", err)
+	}
+
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("sync backup: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close backup: %w", err)
+	}
+
+	// Atomic rename.
+	if err := os.Rename(tmpPath, backupPath); err != nil {
+		return fmt.Errorf("rename backup: %w", err)
+	}
+
+	return nil
 }

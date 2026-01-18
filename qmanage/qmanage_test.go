@@ -589,9 +589,13 @@ func TestPersistence(t *testing.T) {
 		t.Fatalf("NewAuthManager: %v", err)
 	}
 
-	// Add some data.
+	// Add some data and authorize the client (unauthorized clients are memory-only).
 	csrPEM, _, _ := qdef.CreateCSR("test-client")
-	auth1.SignProvisioningCSR(csrPEM, "test-client", []string{"worker"})
+	certPEM, _ := auth1.SignProvisioningCSR(csrPEM, "test-client", []string{"worker"})
+	block, _ := pem.Decode(certPEM)
+	leaf, _ := x509.ParseCertificate(block.Bytes)
+	fp := qdef.FingerprintOf(leaf)
+	auth1.SetClientStatus(fp, qdef.StatusAuthorized)
 
 	caCert := auth1.RootCert()
 	auth1.Close()
@@ -839,30 +843,18 @@ func TestUpdateClientAddr(t *testing.T) {
 		t.Error("expected client to be offline after UpdateClientAddr with online=false")
 	}
 
-	// Verify updating unknown client creates a new record (upsert behavior).
+	// Verify updating unknown client does NOT create a new record
+	// (unauthorized clients must go through provisioning first).
 	unknownFP := qdef.FP{0x99, 0x99} // non-zero FP that doesn't exist
 	unknownAddr := netip.MustParseAddrPort("1.2.3.4:5678")
 	err = auth.UpdateClientAddr(unknownFP, true, unknownAddr, "new-host")
 	if err != nil {
 		t.Errorf("UpdateClientAddr for unknown client should succeed, got %v", err)
 	}
-	// Verify the record was created with correct values.
+	// Verify the record was NOT created.
 	clients = auth.ListClients(qmanage.ClientFilter{})
-	newRec, ok := clients[unknownFP]
-	if !ok {
-		t.Fatal("expected new client record to be created")
-	}
-	if newRec.Hostname != "new-host" {
-		t.Errorf("expected hostname 'new-host', got %q", newRec.Hostname)
-	}
-	if newRec.LastAddr != unknownAddr {
-		t.Errorf("expected LastAddr %v, got %v", unknownAddr, newRec.LastAddr)
-	}
-	if !newRec.Online {
-		t.Error("expected new client to be online")
-	}
-	if newRec.Status != qdef.StatusUnauthorized {
-		t.Errorf("expected status Unauthorized, got %v", newRec.Status)
+	if _, ok := clients[unknownFP]; ok {
+		t.Fatal("expected unknown client record to NOT be created")
 	}
 }
 

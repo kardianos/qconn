@@ -31,10 +31,12 @@ var clientTransitions = []qstate.Transition[qdef.ClientState]{
 
 	// From Provisioned
 	{From: qdef.StateProvisioned, To: qdef.StateConnecting, Name: "connect_after_provision"},
+	{From: qdef.StateProvisioned, To: qdef.StateProvisioning, Name: "reprovision"},
 	{From: qdef.StateProvisioned, To: qdef.StateDisconnected, Name: "provision_reset"},
 
 	// From Connecting
 	{From: qdef.StateConnecting, To: qdef.StateConnecting, Name: "connection_retry"},
+	{From: qdef.StateConnecting, To: qdef.StateProvisioning, Name: "reprovision_from_connecting"},
 	{From: qdef.StateConnecting, To: qdef.StateConnected, Name: "connection_established"},
 	{From: qdef.StateConnecting, To: qdef.StateDisconnected, Name: "connection_failed"},
 
@@ -67,6 +69,24 @@ type Client struct {
 	lastRenewalAttempt time.Time
 	nextID             int64
 	Router             qdef.StreamRouter
+
+	// Stream pool for request/response.
+	// Uses a small pool of reusable streams to avoid QUIC stream limits.
+	poolMu   sync.Mutex
+	pool     []*pooledStream // Available streams
+	poolSize int             // Max pool size
+
+	// Stream tracking for diagnostics.
+	streamMu     sync.Mutex
+	streamOpens  int64
+	streamCloses int64
+}
+
+// pooledStream bundles a QUIC stream with its encoder and decoder for reuse.
+type pooledStream struct {
+	stream *quic.Stream
+	enc    *cbor.Encoder
+	dec    *cbor.Decoder
 }
 
 type ClientOpt struct {
@@ -98,6 +118,11 @@ type ClientOpt struct {
 	RenewWindow     time.Duration // Time before expiration to renew (default 15 days)
 	CertValidity    time.Duration // Default certificate validity (not used by client directly but useful for testing)
 	DialTimeout     time.Duration
+
+	// MaxIncomingStreams is the maximum number of concurrent incoming bidirectional streams
+	// the client will accept from the server. If zero, defaults to 10.
+	// This is typically low since servers don't open many streams to clients.
+	MaxIncomingStreams int64
 }
 
 // NewClient creates a new QUIC client.
@@ -115,6 +140,7 @@ func NewClient(opt ClientOpt) *Client {
 	c = &Client{
 		opt:      opt,
 		hostname: hostname,
+		poolSize: 5, // Default pool size
 		state: qstate.New(
 			qdef.StateDisconnected,
 			clientTransitions,
@@ -148,6 +174,96 @@ func (c *Client) SetObserver(o qdef.ClientObserver) {
 	c.opt.Observer = o
 }
 
+// StreamStats returns the number of stream opens, closes, and currently open streams.
+func (c *Client) StreamStats() (opens, closes, open int64) {
+	c.streamMu.Lock()
+	opens = c.streamOpens
+	closes = c.streamCloses
+	c.streamMu.Unlock()
+	open = opens - closes
+	return
+}
+
+func (c *Client) trackStreamOpen() {
+	c.streamMu.Lock()
+	c.streamOpens++
+	c.streamMu.Unlock()
+}
+
+func (c *Client) trackStreamClose() {
+	c.streamMu.Lock()
+	c.streamCloses++
+	c.streamMu.Unlock()
+}
+
+// getPooledStream gets a stream from the pool, or opens a new one if the pool is empty.
+// The caller must return the stream via putPooledStream when done.
+func (c *Client) getPooledStream(ctx context.Context) (*pooledStream, error) {
+	c.poolMu.Lock()
+
+	// Try to get from pool
+	if len(c.pool) > 0 {
+		ps := c.pool[len(c.pool)-1]
+		c.pool = c.pool[:len(c.pool)-1]
+		c.poolMu.Unlock()
+		return ps, nil
+	}
+	c.poolMu.Unlock()
+
+	// Pool empty - open new stream
+	c.mu.RLock()
+	conn := c.conn
+	c.mu.RUnlock()
+
+	if conn == nil || conn.Context().Err() != nil {
+		return nil, qdef.ErrNotConnected
+	}
+
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	c.trackStreamOpen()
+	return &pooledStream{
+		stream: stream,
+		enc:    cbor.NewEncoder(stream),
+		dec:    cbor.NewDecoder(stream),
+	}, nil
+}
+
+// putPooledStream returns a stream to the pool, or closes it if the pool is full.
+func (c *Client) putPooledStream(ps *pooledStream) {
+	if ps == nil {
+		return
+	}
+
+	c.poolMu.Lock()
+	if len(c.pool) < c.poolSize {
+		c.pool = append(c.pool, ps)
+		c.poolMu.Unlock()
+		return
+	}
+	c.poolMu.Unlock()
+
+	// Pool full - close the stream
+	_ = ps.stream.Close()
+	c.trackStreamClose()
+}
+
+// closePool closes all streams in the pool.
+func (c *Client) closePool() {
+	c.poolMu.Lock()
+	pool := c.pool
+	c.pool = nil
+	c.poolMu.Unlock()
+
+	for _, ps := range pool {
+		_ = ps.stream.Close()
+		c.trackStreamClose()
+	}
+}
+
 // Connect starts the client and its connection supervisor.
 func (c *Client) getNextID() qdef.MessageID {
 	return qdef.MessageID(atomic.AddInt64(&c.nextID, 1))
@@ -167,15 +283,33 @@ func (c *Client) getTLSConfig() (*tls.Config, error) {
 		return nil, err
 	}
 
+	// Check if certificate is expired.
+	if len(tlsCert.Certificate) > 0 {
+		leaf, err := x509.ParseCertificate(tlsCert.Certificate[0])
+		if err == nil && timeNow().After(leaf.NotAfter) {
+			return nil, qdef.ErrCredentialsMissing
+		}
+	}
+
 	rootCAs, err := c.opt.CredentialStore.GetRootCAs()
 	if err != nil {
 		return nil, fmt.Errorf("qconn: could not load root CA: %w", err)
+	}
+
+	// Check Root CA expiry - try type assertion for stores that support it.
+	if getter, ok := c.opt.CredentialStore.(interface{ RootCACert() *x509.Certificate }); ok {
+		if rootCert := getter.RootCACert(); rootCert != nil {
+			if timeNow().After(rootCert.NotAfter) {
+				return nil, qdef.ErrCredentialsMissing
+			}
+		}
 	}
 
 	return &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
 		RootCAs:      rootCAs,
 		ServerName:   c.getServerName(),
+		Time:         timeNow,
 	}, nil
 }
 
@@ -340,10 +474,14 @@ func (c *Client) SetDevices(devices []qdef.DeviceInfo) {
 func (c *Client) TriggerUpdateDevices(ctx context.Context) error {
 	c.mu.RLock()
 	devices := c.devices
-	localAddr := c.conn.LocalAddr()
+	conn := c.conn
 	c.mu.RUnlock()
 
-	addr := localAddr.(*net.UDPAddr).AddrPort().Addr()
+	if conn == nil {
+		return qdef.ErrNotConnected
+	}
+
+	addr := conn.LocalAddr().(*net.UDPAddr).AddrPort().Addr()
 
 	req := qdef.DeviceUpdateRequest{
 		Hostname:  c.hostname,
@@ -369,20 +507,14 @@ func (c *Client) TriggerUpdateDevices(ctx context.Context) error {
 }
 
 // Request is a high-level helper that handles ID generation, stream management, and CBOR abstraction.
+// Uses a pool of reusable streams to avoid QUIC stream limits.
 func (c *Client) Request(ctx context.Context, target qdef.Addr, payload any, response any) (qdef.MessageID, error) {
-	c.mu.RLock()
-	conn := c.conn
-	c.mu.RUnlock()
-
-	if conn == nil || conn.Context().Err() != nil {
-		return 0, qdef.ErrNotConnected
-	}
-
-	stream, err := conn.OpenStreamSync(ctx)
+	// Get a stream from the pool
+	ps, err := c.getPooledStream(ctx)
 	if err != nil {
 		return 0, err
 	}
-	defer func() { _ = stream.Close() }()
+	defer c.putPooledStream(ps)
 
 	var rawPayload []byte
 	if payload != nil {
@@ -399,15 +531,17 @@ func (c *Client) Request(ctx context.Context, target qdef.Addr, payload any, res
 		Payload: rawPayload,
 	}
 
-	if err := cbor.NewEncoder(stream).Encode(msg); err != nil {
+	// Send request
+	if err := ps.enc.Encode(msg); err != nil {
 		return msgID, err
 	}
 
-	// Always decode response to check for errors from the server.
+	// Wait for response (blocking read on this stream)
 	var respMsg qdef.Message
-	if err := cbor.NewDecoder(stream).Decode(&respMsg); err != nil {
+	if err := ps.dec.Decode(&respMsg); err != nil {
 		return msgID, err
 	}
+
 	if respMsg.Error != "" {
 		return msgID, errors.New(respMsg.Error)
 	}
@@ -416,7 +550,6 @@ func (c *Client) Request(ctx context.Context, target qdef.Addr, payload any, res
 			return msgID, err
 		}
 	}
-
 	return msgID, nil
 }
 
@@ -515,7 +648,7 @@ func (c *Client) supervisor(ctx context.Context) {
 					if window == 0 {
 						window = 15 * 24 * time.Hour
 					}
-					now := time.Now()
+					now := timeNow()
 					if now.After(leaf.NotAfter.Add(-window)) {
 						c.mu.Lock()
 						lastAttempt := c.lastRenewalAttempt
@@ -601,9 +734,14 @@ func (c *Client) attemptConnect(ctx context.Context, tlsConfig *tls.Config) {
 	if kap == 0 {
 		kap = DefaultKeepAlivePeriod
 	}
+	maxStreams := c.opt.MaxIncomingStreams
+	if maxStreams == 0 {
+		maxStreams = 10 // Default to 10 for client (server rarely opens streams to client)
+	}
 	qc := &quic.Config{
-		KeepAlivePeriod: kap,
-		MaxIdleTimeout:  kap * 4,
+		KeepAlivePeriod:    kap,
+		MaxIdleTimeout:     kap * 4,
+		MaxIncomingStreams: maxStreams,
 	}
 
 	conn, err := quic.DialAddr(dialCtx, c.lastAddr, tlsConfig, qc)

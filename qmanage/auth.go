@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -48,8 +49,9 @@ type BoltAuthManager struct {
 	serverCert     *tls.Certificate
 	serverHostname string
 
-	mu      sync.RWMutex
-	signals map[qdef.FP]chan struct{}
+	mu             sync.RWMutex
+	signals        map[qdef.FP]chan struct{}
+	pendingClients map[qdef.FP]ClientRecord // Unauthorized clients stored in memory only
 
 	// Cleanup goroutine control.
 	cleanupStop chan struct{}
@@ -88,6 +90,7 @@ func NewAuthManager(cfg AuthManagerConfig) (*BoltAuthManager, error) {
 		dbPath:         dbPath,
 		serverHostname: cfg.ServerHostname,
 		signals:        make(map[qdef.FP]chan struct{}),
+		pendingClients: make(map[qdef.FP]ClientRecord),
 	}
 
 	if m.serverHostname == "" {
@@ -124,6 +127,13 @@ func NewAuthManager(cfg AuthManagerConfig) (*BoltAuthManager, error) {
 			db.Close()
 			return nil, fmt.Errorf("load/create CA: %w", err)
 		}
+	}
+
+	// Run cleanup once at startup to remove any stale unauthorized or expired clients.
+	if removed, err := m.CleanupExpiredClients(); err != nil {
+		log.Printf("qmanage: startup cleanup error: %v", err)
+	} else if removed > 0 {
+		log.Printf("qmanage: startup cleanup removed %d stale clients", removed)
 	}
 
 	// Start cleanup goroutine unless disabled.
@@ -194,6 +204,31 @@ func (m *BoltAuthManager) loadOrCreateCA() error {
 		m.caKey = key
 		return m.saveCA()
 	}
+
+	// Check if CA is expired and regenerate if needed.
+	if timeNow().After(m.caCert.NotAfter) {
+		log.Printf("qmanage: Root CA expired, regenerating (all existing client certificates will be invalidated)")
+		cert, key, err := qdef.CreateCA()
+		if err != nil {
+			return fmt.Errorf("create CA: %w", err)
+		}
+		m.caCert = cert
+		m.caKey = key
+		// Clear the server cert cache so it gets regenerated with new CA
+		m.serverCert = nil
+		if err := m.saveCA(); err != nil {
+			return err
+		}
+		// Delete stored server cert to force regeneration with new CA
+		_ = m.db.Update(func(tx *bbolt.Tx) error {
+			b := tx.Bucket(bucketServerCert)
+			_ = b.Delete(keySrvC)
+			_ = b.Delete(keySrvK)
+			_ = b.Delete(keySrvHost)
+			return nil
+		})
+	}
+
 	return nil
 }
 
@@ -217,6 +252,18 @@ func (m *BoltAuthManager) saveCA() error {
 // GetStatus returns the authorization status of a client.
 // Returns StatusRevoked if the client's certificate has expired.
 func (m *BoltAuthManager) GetStatus(fp qdef.FP) (qdef.ClientStatus, error) {
+	// Check pending clients first (unauthorized, in-memory only).
+	m.mu.RLock()
+	if rec, ok := m.pendingClients[fp]; ok {
+		m.mu.RUnlock()
+		// Check if certificate has expired.
+		if !rec.ExpiresAt.IsZero() && timeNow().After(rec.ExpiresAt) {
+			return qdef.StatusRevoked, nil
+		}
+		return rec.Status, nil
+	}
+	m.mu.RUnlock()
+
 	var status qdef.ClientStatus
 	err := m.db.View(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketClients)
@@ -230,7 +277,7 @@ func (m *BoltAuthManager) GetStatus(fp qdef.FP) (qdef.ClientStatus, error) {
 			return fmt.Errorf("unmarshal client record: %w", err)
 		}
 		// Check if certificate has expired.
-		if !rec.ExpiresAt.IsZero() && time.Now().After(rec.ExpiresAt) {
+		if !rec.ExpiresAt.IsZero() && timeNow().After(rec.ExpiresAt) {
 			status = qdef.StatusRevoked
 			return nil
 		}
@@ -293,7 +340,7 @@ func (m *BoltAuthManager) SignProvisioningCSR(csrPEM []byte, hostname string, ro
 	}
 	fp := qdef.FingerprintOf(leaf)
 
-	// Store client record.
+	// Store client record in memory (unauthorized clients are not persisted).
 	rec := ClientRecord{
 		Fingerprint:    fp,
 		Hostname:       hostname,
@@ -303,17 +350,9 @@ func (m *BoltAuthManager) SignProvisioningCSR(csrPEM []byte, hostname string, ro
 		ExpiresAt:      leaf.NotAfter,
 	}
 
-	err = m.db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketClients)
-		data, err := cbor.Marshal(rec)
-		if err != nil {
-			return err
-		}
-		return b.Put(fp[:], data)
-	})
-	if err != nil {
-		return nil, fmt.Errorf("store client record: %w", err)
-	}
+	m.mu.Lock()
+	m.pendingClients[fp] = rec
+	m.mu.Unlock()
 
 	m.triggerSignal(fp)
 	return certPEM, nil
@@ -399,12 +438,18 @@ func (m *BoltAuthManager) RootCert() *x509.Certificate {
 
 // ServerCertificate returns the server's TLS certificate.
 // The certificate hostname is configured via AuthManagerConfig.ServerHostname.
+// If the certificate is expired or close to expiry (within 1 hour), a new one is generated.
 func (m *BoltAuthManager) ServerCertificate() (tls.Certificate, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Check if cached cert is still valid.
 	if m.serverCert != nil {
-		return *m.serverCert, nil
+		if !m.isCertExpiringSoon(m.serverCert) {
+			return *m.serverCert, nil
+		}
+		// Cert is expiring soon, clear cache and regenerate.
+		m.serverCert = nil
 	}
 
 	// Try to load from database.
@@ -423,15 +468,15 @@ func (m *BoltAuthManager) ServerCertificate() (tls.Certificate, error) {
 		return tls.Certificate{}, fmt.Errorf("load server cert: %w", err)
 	}
 
-	// Only use stored cert if hostname matches.
+	// Only use stored cert if hostname matches and cert is not expiring soon.
 	if certPEM != nil && keyPEM != nil && storedHostname == m.serverHostname {
 		cert, err := tls.X509KeyPair(certPEM, keyPEM)
-		if err == nil {
+		if err == nil && !m.isCertExpiringSoon(&cert) {
 			m.serverCert = &cert
 			return cert, nil
 		}
+		// Cert is expired/expiring or failed to parse, will regenerate below.
 	}
-
 	// Create new server certificate with configured hostname.
 	certPEM, keyPEM, err = qdef.CreateCert(m.caCert, m.caKey, m.serverHostname, true)
 	if err != nil {
@@ -461,11 +506,59 @@ func (m *BoltAuthManager) ServerCertificate() (tls.Certificate, error) {
 	return cert, nil
 }
 
+// isCertExpiringSoon checks if the certificate is expired or will expire within 1 hour.
+func (m *BoltAuthManager) isCertExpiringSoon(cert *tls.Certificate) bool {
+	if cert == nil || len(cert.Certificate) == 0 {
+		return true
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return true
+	}
+	return timeNow().Add(time.Hour).After(leaf.NotAfter)
+}
+
 // SetClientStatus updates a client's status.
+// If the client is pending (unauthorized in memory) and status is Authorized,
+// it is moved to the database. If status is Revoked, the pending client is deleted.
 func (m *BoltAuthManager) SetClientStatus(fp qdef.FP, status qdef.ClientStatus) error {
 	if fp.IsZero() {
 		return errors.New("missing fingerprint to set client status")
 	}
+
+	// Check if client is pending (in memory only).
+	m.mu.Lock()
+	pendingRec, isPending := m.pendingClients[fp]
+	if isPending {
+		if status == qdef.StatusAuthorized {
+			// Move from pending to DB with authorized status.
+			pendingRec.Status = status
+			delete(m.pendingClients, fp)
+			m.mu.Unlock()
+
+			err := m.db.Update(func(tx *bbolt.Tx) error {
+				b := tx.Bucket(bucketClients)
+				data, err := cbor.Marshal(pendingRec)
+				if err != nil {
+					return err
+				}
+				return b.Put(fp[:], data)
+			})
+			if err != nil {
+				return err
+			}
+			m.triggerSignal(fp)
+			return nil
+		}
+		// For any other status (revoked, etc.), just remove from pending.
+		delete(m.pendingClients, fp)
+		m.mu.Unlock()
+		m.triggerSignal(fp)
+		return nil
+	}
+	m.mu.Unlock()
+
+	// Client is not pending, update in DB.
 	err := m.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketClients)
 		data := b.Get(fp[:])
@@ -503,35 +596,44 @@ func (m *BoltAuthManager) SetClientStatus(fp qdef.FP, status qdef.ClientStatus) 
 
 // UpdateClientAddr updates a client's connection info when they connect.
 // Sets the address, marks them as online, updates LastSeen, and sets hostname if empty.
-// If no record exists, creates one with the provided hostname.
+// Updates pending clients in memory, authorized clients in DB.
+// Returns nil if client not found (does not create new records).
 func (m *BoltAuthManager) UpdateClientAddr(fp qdef.FP, online bool, addr netip.AddrPort, hostname string) error {
 	now := time.Now()
+
+	// Check pending clients first.
+	m.mu.Lock()
+	if rec, ok := m.pendingClients[fp]; ok {
+		rec.LastAddr = addr
+		rec.Online = online
+		rec.LastSeen = now
+		if rec.Hostname == "" && hostname != "" {
+			rec.Hostname = hostname
+		}
+		m.pendingClients[fp] = rec
+		m.mu.Unlock()
+		return nil
+	}
+	m.mu.Unlock()
+
+	// Update in DB if client exists there.
 	return m.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketClients)
 		data := b.Get(fp[:])
+		if data == nil {
+			// Client not found - don't create unauthorized clients in DB.
+			return nil
+		}
 
 		var rec ClientRecord
-		if data == nil {
-			// Create new record for client connecting without prior provisioning.
-			rec = ClientRecord{
-				Fingerprint: fp,
-				Hostname:    hostname,
-				Status:      qdef.StatusUnauthorized,
-				CreatedAt:   now,
-				LastAddr:    addr,
-				Online:      online,
-				LastSeen:    now,
-			}
-		} else {
-			if err := cbor.Unmarshal(data, &rec); err != nil {
-				return fmt.Errorf("unmarshal client record: %w", err)
-			}
-			rec.LastAddr = addr
-			rec.Online = online
-			rec.LastSeen = now
-			if rec.Hostname == "" && hostname != "" {
-				rec.Hostname = hostname
-			}
+		if err := cbor.Unmarshal(data, &rec); err != nil {
+			return fmt.Errorf("unmarshal client record: %w", err)
+		}
+		rec.LastAddr = addr
+		rec.Online = online
+		rec.LastSeen = now
+		if rec.Hostname == "" && hostname != "" {
+			rec.Hostname = hostname
 		}
 
 		newData, err := cbor.Marshal(rec)
@@ -570,6 +672,8 @@ func (m *BoltAuthManager) ClearAllOnline() error {
 // Returns an empty map if an error occurs during iteration.
 func (m *BoltAuthManager) ListClients(filter ClientFilter) map[qdef.FP]ClientRecord {
 	result := make(map[qdef.FP]ClientRecord)
+
+	// First, get clients from DB.
 	err := m.db.View(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketClients)
 
@@ -615,6 +719,34 @@ func (m *BoltAuthManager) ListClients(filter ClientFilter) map[qdef.FP]ClientRec
 	if err != nil {
 		return make(map[qdef.FP]ClientRecord)
 	}
+
+	// Include pending clients (unauthorized, in-memory only).
+	// Skip if filter requires StatusAuthorized (pending clients are unauthorized).
+	if filter.Status != nil && *filter.Status == qdef.StatusAuthorized {
+		return result
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if len(filter.Fingerprints) > 0 {
+		// Direct lookups for specified fingerprints.
+		for _, fp := range filter.Fingerprints {
+			if rec, ok := m.pendingClients[fp]; ok {
+				if filter.Status == nil || rec.Status == *filter.Status {
+					result[fp] = rec
+				}
+			}
+		}
+	} else {
+		// No fingerprint filter, include all pending clients.
+		for fp, rec := range m.pendingClients {
+			if filter.Status == nil || rec.Status == *filter.Status {
+				result[fp] = rec
+			}
+		}
+	}
+
 	return result
 }
 
@@ -659,12 +791,21 @@ func (m *BoltAuthManager) ListClientsInfo(showUnauthorized bool, fingerprints []
 // DeleteClient removes a client record.
 // Also cleans up any signal channels associated with the client.
 func (m *BoltAuthManager) DeleteClient(fp qdef.FP) error {
-	err := m.db.Update(func(tx *bbolt.Tx) error {
-		clients := tx.Bucket(bucketClients)
-		return clients.Delete(fp[:])
-	})
-	if err != nil {
-		return err
+	// Try to delete from pending clients first.
+	m.mu.Lock()
+	_, wasPending := m.pendingClients[fp]
+	delete(m.pendingClients, fp)
+	m.mu.Unlock()
+
+	// Also delete from DB (in case it was promoted or existed before).
+	if !wasPending {
+		err := m.db.Update(func(tx *bbolt.Tx) error {
+			clients := tx.Bucket(bucketClients)
+			return clients.Delete(fp[:])
+		})
+		if err != nil {
+			return err
+		}
 	}
 	// Clean up signal channel.
 	m.cleanupSignal(fp)
@@ -700,15 +841,16 @@ func (m *BoltAuthManager) cleanupLoop(interval time.Duration) {
 	}
 }
 
-// CleanupExpiredClients removes client records for certificates
-// that have expired. This prevents the database from growing indefinitely.
+// CleanupExpiredClients removes client records for certificates that have expired
+// and unauthorized clients (which should only be stored in memory, not persisted).
+// This prevents the database from growing indefinitely.
 // Returns the number of clients removed and any database error encountered.
 func (m *BoltAuthManager) CleanupExpiredClients() (int, error) {
 	now := time.Now()
 	var removed int
 
-	// Collect expired fingerprints.
-	var expiredFPs []qdef.FP
+	// Collect fingerprints to remove: expired or unauthorized.
+	var toRemove []qdef.FP
 	err := m.db.View(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketClients)
 		return b.ForEach(func(k, v []byte) error {
@@ -716,27 +858,35 @@ func (m *BoltAuthManager) CleanupExpiredClients() (int, error) {
 			if err := cbor.Unmarshal(v, &rec); err != nil {
 				return nil // Skip corrupted records.
 			}
+			// Remove expired clients.
 			if !rec.ExpiresAt.IsZero() && now.After(rec.ExpiresAt) {
 				var fp qdef.FP
 				copy(fp[:], k)
-				expiredFPs = append(expiredFPs, fp)
+				toRemove = append(toRemove, fp)
+				return nil
+			}
+			// Remove unauthorized clients (they should be in memory only).
+			if rec.Status == qdef.StatusUnauthorized {
+				var fp qdef.FP
+				copy(fp[:], k)
+				toRemove = append(toRemove, fp)
 			}
 			return nil
 		})
 	})
 	if err != nil {
-		return 0, fmt.Errorf("scan expired clients: %w", err)
+		return 0, fmt.Errorf("scan clients for cleanup: %w", err)
 	}
 
-	if len(expiredFPs) == 0 {
+	if len(toRemove) == 0 {
 		return 0, nil
 	}
 
-	// Delete expired records.
+	// Delete records.
 	err = m.db.Update(func(tx *bbolt.Tx) error {
 		clients := tx.Bucket(bucketClients)
 
-		for _, fp := range expiredFPs {
+		for _, fp := range toRemove {
 			if err := clients.Delete(fp[:]); err == nil {
 				removed++
 			}
@@ -744,11 +894,11 @@ func (m *BoltAuthManager) CleanupExpiredClients() (int, error) {
 		return nil
 	})
 	if err != nil {
-		return removed, fmt.Errorf("delete expired clients: %w", err)
+		return removed, fmt.Errorf("delete clients: %w", err)
 	}
 
 	// Clean up signal channels.
-	for _, fp := range expiredFPs {
+	for _, fp := range toRemove {
 		m.cleanupSignal(fp)
 	}
 

@@ -68,16 +68,24 @@ type machineInfo struct {
 	Devices   []qdef.DeviceInfo
 }
 
+// provisioningCertEntry holds a provisioning certificate with its CA for regeneration.
+type provisioningCertEntry struct {
+	cert      *tls.Certificate
+	expiresAt time.Time
+	ca        tls.Certificate // CA for regenerating expired certs
+}
+
 // Server implements the QUIC server logic with integrated connection and role management.
 type Server struct {
 	addr                       string
 	tlsConfig                  *tls.Config
 	authManager                qdef.AuthorizationManager
-	provisioningPool           *x509.CertPool
-	provisioningCerts          map[string]*tls.Certificate // SNI -> server cert for provisioning
-	mainCert                   tls.Certificate             // Main server certificate
+	provisioningCerts          map[string]*provisioningCertEntry // SNI -> provisioning cert entry
+	provisioningMu             sync.Mutex                        // Protects provisioningCerts
+	mainCert                   tls.Certificate                   // Main server certificate
 	observer                   qdef.ClientObserver
 	keepAlivePeriod            time.Duration
+	maxIncomingStreams         int64
 	renewalLimiter             *rateLimiter[qdef.FP]
 	provisioningLimiter        *rateLimiter[netip.Addr]
 	maxMessageSize             int
@@ -103,6 +111,11 @@ type Server struct {
 	// External integration
 	observers     []qdef.ConnectionObserver
 	messageRouter qdef.MessageRouter
+
+	// Stream tracking for diagnostics.
+	streamMu     sync.Mutex
+	streamOpens  int64
+	streamCloses int64
 }
 
 const (
@@ -165,6 +178,11 @@ type ServerOpt struct {
 	// If zero, defaults to qdef.ProvisioningMaxMessageSize (64KB).
 	// This should be kept small since provisioning only needs CSR and hostname.
 	ProvisioningMaxMessageSize int
+
+	// MaxIncomingStreams is the maximum number of concurrent incoming bidirectional streams.
+	// If zero, defaults to 1000. The quic-go library default of 100 is too low for
+	// applications with frequent short-lived streams like device updates.
+	MaxIncomingStreams int64
 }
 
 // NewServer creates a new QUIC server.
@@ -181,7 +199,7 @@ func NewServer(opt ServerOpt) (*Server, error) {
 	caPool.AddCert(opt.Auth.RootCert())
 
 	provisioningPool := x509.NewCertPool()
-	provisioningCerts := make(map[string]*tls.Certificate)
+	provisioningCerts := make(map[string]*provisioningCertEntry)
 	for _, token := range opt.ProvisionTokens {
 		ca, err := qdef.GenerateDerivedCA(token)
 		if err == nil {
@@ -191,23 +209,25 @@ func NewServer(opt ServerOpt) (*Server, error) {
 			}
 			// Generate a server cert signed by this derived CA.
 			sni := qdef.ProvisioningServerName(token)
-			serverCert, err := qdef.GenerateProvisioningServerCert(ca, sni)
+			serverCert, expiresAt, err := qdef.GenerateProvisioningServerCert(ca, sni)
 			if err == nil {
-				provisioningCerts[sni] = &serverCert
+				provisioningCerts[sni] = &provisioningCertEntry{
+					cert:      &serverCert,
+					expiresAt: expiresAt,
+					ca:        ca,
+				}
 			}
 		}
 	}
+
+	// Create a placeholder for the server so GetCertificate can reference it.
+	var s *Server
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		ClientAuth:   tls.RequireAnyClientCert,
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			// Check if this is a provisioning request by SNI.
-			if provCert, ok := provisioningCerts[hello.ServerName]; ok {
-				return provCert, nil
-			}
-			// Return nil to use the default certificate from Certificates.
-			return nil, nil
+			return s.getProvisioningCert(hello.ServerName)
 		},
 		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 			if len(rawCerts) == 0 {
@@ -257,6 +277,7 @@ func NewServer(opt ServerOpt) (*Server, error) {
 			}
 			return nil
 		},
+		Time: timeNow,
 	}
 
 	renewalInterval := opt.RenewalInterval
@@ -286,15 +307,15 @@ func NewServer(opt ServerOpt) (*Server, error) {
 		defaultWait = 10 * time.Second
 	}
 
-	s := &Server{
+	s = &Server{
 		addr:                       opt.ListenOn,
 		tlsConfig:                  tlsConfig,
 		authManager:                opt.Auth,
-		provisioningPool:           provisioningPool,
 		provisioningCerts:          provisioningCerts,
 		mainCert:                   cert,
 		observer:                   opt.Observer,
 		keepAlivePeriod:            opt.KeepAlivePeriod,
+		maxIncomingStreams:         opt.MaxIncomingStreams,
 		renewalLimiter:             newRateLimiter[qdef.FP](bgCtx, renewalInterval),
 		provisioningLimiter:        newRateLimiter[netip.Addr](bgCtx, provisioningInterval),
 		maxMessageSize:             maxMsgSize,
@@ -322,6 +343,38 @@ func NewServer(opt ServerOpt) (*Server, error) {
 	qdef.Handle(&s.Router, qdef.ServiceSystem, "revoke", s.handleRevoke)
 
 	return s, nil
+}
+
+// getProvisioningCert returns the provisioning certificate for the given SNI,
+// regenerating it if it's close to expiry (within 1 hour).
+// The provisioningCerts cache is setup on startup.
+func (s *Server) getProvisioningCert(sni string) (*tls.Certificate, error) {
+	s.provisioningMu.Lock()
+	defer s.provisioningMu.Unlock()
+
+	entry, ok := s.provisioningCerts[sni]
+	if !ok {
+		// Not a provisioning request, return nil to use default certificate.
+		return nil, nil
+	}
+
+	// Check cached expiry - no X.509 parsing needed.
+	if timeNow().Add(time.Hour).After(entry.expiresAt) {
+		// Cert is expiring soon, regenerate it.
+		newCert, expiresAt, err := qdef.GenerateProvisioningServerCert(entry.ca, sni)
+		if err != nil {
+			// Error regenerating, return existing cert.
+			return entry.cert, nil
+		}
+		s.provisioningCerts[sni] = &provisioningCertEntry{
+			cert:      &newCert,
+			expiresAt: expiresAt,
+			ca:        entry.ca,
+		}
+		return &newCert, nil
+	}
+
+	return entry.cert, nil
 }
 
 func (s *Server) logf(id qdef.Identity, format string, v ...any) {
@@ -368,9 +421,14 @@ func (s *Server) Serve(ctx context.Context, packetConn net.PacketConn) error {
 	if kap == 0 {
 		kap = DefaultKeepAlivePeriod
 	}
+	maxStreams := s.maxIncomingStreams
+	if maxStreams == 0 {
+		maxStreams = 1000 // Default to 1000 instead of quic-go's 100
+	}
 	qc := &quic.Config{
-		KeepAlivePeriod: kap,
-		MaxIdleTimeout:  kap * 4,
+		KeepAlivePeriod:    kap,
+		MaxIdleTimeout:     kap * 4,
+		MaxIncomingStreams: maxStreams,
 	}
 	listener, err := quic.Listen(packetConn, s.tlsConfig, qc)
 	if err != nil {
@@ -401,6 +459,28 @@ func (s *Server) Close() {
 	if s.cancel != nil {
 		s.cancel()
 	}
+}
+
+// StreamStats returns the number of stream opens, closes, and currently open streams.
+func (s *Server) StreamStats() (opens, closes, open int64) {
+	s.streamMu.Lock()
+	opens = s.streamOpens
+	closes = s.streamCloses
+	s.streamMu.Unlock()
+	open = opens - closes
+	return
+}
+
+func (s *Server) trackStreamOpen() {
+	s.streamMu.Lock()
+	s.streamOpens++
+	s.streamMu.Unlock()
+}
+
+func (s *Server) trackStreamClose() {
+	s.streamMu.Lock()
+	s.streamCloses++
+	s.streamMu.Unlock()
 }
 
 // acceptLoop correctly takes the *quic.Listener struct pointer.
@@ -458,16 +538,11 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn) (err err
 		s.notifyState(id, serverConnStateToClientState(to))
 	})
 
-	// Check for provisioning extension instead of hostname.
+	// Check for provisioning extension.
 	var isProvisioning bool
-	for _, cert := range pcList {
-		for _, ext := range cert.Extensions {
-			if ext.Id.Equal(qdef.OIDProvisioningIdentity) {
-				isProvisioning = true
-				break
-			}
-		}
-		if isProvisioning {
+	for _, ext := range leaf.Extensions {
+		if ext.Id.Equal(qdef.OIDProvisioningIdentity) {
+			isProvisioning = true
 			break
 		}
 	}
@@ -489,12 +564,13 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn) (err err
 		}
 	}()
 
-	if isProvisioning {
+	switch isProvisioning {
+	case true:
 		// Transition: New -> Provisioning
 		if err := connState.TransitionTo(qdef.ConnProvisioning); err != nil {
 			s.logf(id, "qconn: state transition error: %v", err)
 		}
-	} else {
+	case false:
 		// Transition: New -> PendingAuth
 		if err := connState.TransitionTo(qdef.ConnPendingAuth); err != nil {
 			s.logf(id, "qconn: state transition error: %v", err)
@@ -563,7 +639,11 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn) (err err
 }
 
 func (s *Server) handleStream(ctx context.Context, id qdef.Identity, stream *quic.Stream, provisioningCert bool) {
-	defer func() { _ = stream.Close() }()
+	s.trackStreamOpen()
+	defer func() {
+		_ = stream.Close()
+		s.trackStreamClose()
+	}()
 
 	// Use strict size limits for provisioning clients to prevent abuse.
 	maxSize := s.maxMessageSize
@@ -571,78 +651,82 @@ func (s *Server) handleStream(ctx context.Context, id qdef.Identity, stream *qui
 		maxSize = s.provisioningMaxMessageSize
 	}
 	dec := qdef.NewDecoder(stream, maxSize)
-
-	var msg qdef.Message
-	if err := dec.Decode(&msg); err != nil {
-		if err != io.EOF {
-			s.logf(id, "failed to decode message: %v", err)
-		}
-		return
-	}
-
-	if provisioningCert {
-		msg.Target.Service = qdef.ServiceProvision
-	} else {
-		if msg.Target.Service == qdef.ServiceProvision {
-			msg.Target.Service = qdef.ServiceUser
-		}
-	}
+	enc := cbor.NewEncoder(stream)
 
 	// Helper to send response message.
 	sendMessage := func(respMsg *qdef.Message) {
-		if encErr := cbor.NewEncoder(stream).Encode(respMsg); encErr != nil {
+		if encErr := enc.Encode(respMsg); encErr != nil {
 			s.logf(id, "failed to encode response: %v", encErr)
 		}
 	}
 
-	// Helper to send typed response (marshals to CBOR).
-	sendResponse := func(resp any, respErr error) {
-		var respMsg qdef.Message
-		respMsg.ID = msg.ID
-		if respErr != nil {
-			respMsg.Error = respErr.Error()
-		} else {
-			payload, err := cbor.Marshal(resp)
-			if err != nil {
-				s.logf(id, "failed to marshal response for %s/%s: %v", msg.Target.Service, msg.Target.Type, err)
-				respMsg.Error = fmt.Sprintf("failed to marshal response: %v", err)
-			} else {
-				respMsg.Payload = payload
+	// Loop to handle multiple messages per stream (multiplexed streams).
+	for {
+		var msg qdef.Message
+		if err := dec.Decode(&msg); err != nil {
+			if err != io.EOF {
+				s.logf(id, "failed to decode message: %v", err)
 			}
-		}
-		sendMessage(&respMsg)
-	}
-
-	// Try registered handlers first (ServiceProvision, ServiceSystem).
-	resp, err := s.Router.Dispatch(ctx, id, msg)
-	if err == nil {
-		sendResponse(resp, nil)
-		return
-	}
-
-	// If no handler found, route the message to target machine.
-	if errors.Is(err, qdef.ErrNoHandler) {
-		// Look up the sender's full identity with roles from our stored state.
-		senderID := s.getIdentity(id.Fingerprint)
-		if senderID.Hostname == "" {
-			senderID.Hostname = id.Hostname
-		}
-		if !senderID.Address.IsValid() {
-			senderID.Address = id.Address
-		}
-
-		respMsg, routeErr := s.route(ctx, senderID, msg)
-		if routeErr != nil {
-			sendResponse(nil, routeErr)
 			return
 		}
-		sendMessage(respMsg)
-		return
-	}
 
-	// Log dispatch errors and send error response.
-	s.logf(id, "dispatch error for %s/%s: %v", msg.Target.Service, msg.Target.Type, err)
-	sendResponse(nil, err)
+		if provisioningCert {
+			msg.Target.Service = qdef.ServiceProvision
+		} else {
+			if msg.Target.Service == qdef.ServiceProvision {
+				msg.Target.Service = qdef.ServiceUser
+			}
+		}
+
+		// Helper to send typed response (marshals to CBOR).
+		sendResponse := func(resp any, respErr error) {
+			var respMsg qdef.Message
+			respMsg.ID = msg.ID
+			if respErr != nil {
+				respMsg.Error = respErr.Error()
+			} else {
+				payload, err := cbor.Marshal(resp)
+				if err != nil {
+					s.logf(id, "failed to marshal response for %s/%s: %v", msg.Target.Service, msg.Target.Type, err)
+					respMsg.Error = fmt.Sprintf("failed to marshal response: %v", err)
+				} else {
+					respMsg.Payload = payload
+				}
+			}
+			sendMessage(&respMsg)
+		}
+
+		// Try registered handlers first (ServiceProvision, ServiceSystem).
+		resp, err := s.Router.Dispatch(ctx, id, msg)
+		if err == nil {
+			sendResponse(resp, nil)
+			continue
+		}
+
+		// If no handler found, route the message to target machine.
+		if errors.Is(err, qdef.ErrNoHandler) {
+			// Look up the sender's full identity with roles from our stored state.
+			senderID := s.getIdentity(id.Fingerprint)
+			if senderID.Hostname == "" {
+				senderID.Hostname = id.Hostname
+			}
+			if !senderID.Address.IsValid() {
+				senderID.Address = id.Address
+			}
+
+			respMsg, routeErr := s.route(ctx, senderID, msg)
+			if routeErr != nil {
+				sendResponse(nil, routeErr)
+				continue
+			}
+			sendMessage(respMsg)
+			continue
+		}
+
+		// Log dispatch errors and send error response.
+		s.logf(id, "dispatch error for %s/%s: %v", msg.Target.Service, msg.Target.Type, err)
+		sendResponse(nil, err)
+	}
 }
 
 func (s *Server) handleRenewal(ctx context.Context, id qdef.Identity, req *qdef.RenewalRequest) (*qdef.CredentialResponse, error) {
@@ -1010,20 +1094,23 @@ func (s *Server) handleListClients(ctx context.Context, id qdef.Identity, req *q
 
 	clients := s.authManager.ListClientsInfo(req.ShowUnauthorized, req.Fingerprint)
 
-	// Include devices from server's in-memory map if requested.
-	if req.IncludeDevices {
-		s.mu.RLock()
-		for i := range clients {
-			c := &clients[i]
-			m, ok := s.devices[c.Fingerprint]
-			if ok {
+	// Set Online status from activeConns and Self from requester's fingerprint.
+	s.mu.RLock()
+	for i := range clients {
+		c := &clients[i]
+		_, c.Online = s.activeConns[c.Fingerprint]
+		c.Self = c.Fingerprint == id.Fingerprint
+
+		// Include devices from server's in-memory map if requested.
+		if req.IncludeDevices {
+			if m, ok := s.devices[c.Fingerprint]; ok {
 				c.Hostname = m.Hostname
 				c.LocalAddr = m.LocalAddr
 				c.Devices = m.Devices
 			}
 		}
-		s.mu.RUnlock()
 	}
+	s.mu.RUnlock()
 
 	// Include external targets from MessageRouter if requested.
 	if req.IncludeExternal {

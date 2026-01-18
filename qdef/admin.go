@@ -30,6 +30,7 @@ type ClientInfo struct {
 	Status         ClientStatus   `cbor:"status"`
 	Authorized     bool           `cbor:"authorized"` // True if Status == StatusAuthorized.
 	Online         bool           `cbor:"online"`
+	Self           bool           `cbor:"self"` // True if this client is the requester.
 	CreatedAt      time.Time      `cbor:"created_at"`
 	ExpiresAt      time.Time      `cbor:"expires_at"`
 	LastAddr       netip.AddrPort `cbor:"last_addr"`

@@ -115,6 +115,29 @@ func (s *FileCredentialStore) GetRootCAs() (*x509.CertPool, error) {
 	return pool, nil
 }
 
+// RootCACert returns the parsed Root CA certificate for diagnostic purposes.
+func (s *FileCredentialStore) RootCACert() *x509.Certificate {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	caPath := filepath.Join(s.dir, "ca.crt")
+	data, err := os.ReadFile(caPath)
+	if err != nil {
+		return nil
+	}
+
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil
+	}
+	return cert
+}
+
 // SaveCredentials stores the client certificate and private key.
 // Updates the internal fingerprint from the certificate.
 func (s *FileCredentialStore) SaveCredentials(certPEM, keyPEM []byte) error {

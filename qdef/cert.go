@@ -260,48 +260,50 @@ func GenerateDerivedCA(sharedSecret string) (tls.Certificate, error) {
 // ProvisioningServerName returns a deterministic server name derived from the provision token.
 // Both client and server use this to establish a shared TLS server name for provisioning.
 func ProvisioningServerName(token string) string {
-	h := sha256.Sum256([]byte("qconn-provision-sni:" + token))
-	return "provision-" + hex.EncodeToString(h[:8])
+	fp := FingerprintHash([]byte("qconn-provision-sni:" + token))
+	return "provision-" + fp.String()
 }
 
 // GenerateProvisioningServerCert creates a server certificate signed by the derived CA.
 // The hostname should be from ProvisioningServerName for proper SNI matching.
-func GenerateProvisioningServerCert(ca tls.Certificate, hostname string) (tls.Certificate, error) {
+// Returns the certificate, its expiry time, and any error.
+func GenerateProvisioningServerCert(ca tls.Certificate, hostname string) (tls.Certificate, time.Time, error) {
 	caCert, err := x509.ParseCertificate(ca.Certificate[0])
 	if err != nil {
-		return tls.Certificate{}, err
+		return tls.Certificate{}, time.Time{}, err
 	}
 	caKey := ca.PrivateKey.(*ecdsa.PrivateKey)
 
 	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return tls.Certificate{}, err
+		return tls.Certificate{}, time.Time{}, err
 	}
 
 	serial, err := randomSerialNumber()
 	if err != nil {
-		return tls.Certificate{}, err
+		return tls.Certificate{}, time.Time{}, err
 	}
 
+	expiresAt := time.Now().Add(24 * time.Hour)
 	template := &x509.Certificate{
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: hostname},
 		DNSNames:     []string{hostname},
 		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour), // Short-lived for provisioning
+		NotAfter:     expiresAt, // Short-lived for provisioning
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
 
 	certBytes, err := x509.CreateCertificate(rand.Reader, template, caCert, &privKey.PublicKey, caKey)
 	if err != nil {
-		return tls.Certificate{}, err
+		return tls.Certificate{}, time.Time{}, err
 	}
 
 	return tls.Certificate{
 		Certificate: [][]byte{certBytes},
 		PrivateKey:  privKey,
-	}, nil
+	}, expiresAt, nil
 }
 
 // GenerateProvisioningIdentity creates a fresh leaf certificate signed by the derived CA.

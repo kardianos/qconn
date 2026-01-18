@@ -9,7 +9,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
-	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -38,14 +37,16 @@ func randomSerialNumber() (*big.Int, error) {
 	return new(big.Int).SetBytes(serialBytes), nil
 }
 
-const fpSize = 8
+const fpSize = 16
 
-// FP is a certificate fingerprint (SHA-256 hash of the certificate's raw bytes).
+// FP is a certificate fingerprint (truncated BLAKE2b hash of the certificate's raw bytes).
+// The fingerprint is encoded as bech32 with the "qc" prefix for human-readable representation.
 type FP [fpSize]byte
 
-// String returns the hex-encoded fingerprint.
+// String returns the bech32-encoded fingerprint with "qc" prefix.
 func (f FP) String() string {
-	return hex.EncodeToString(f[:])
+	s, _ := Bech32Encode(FPPrefix, f[:])
+	return s
 }
 
 // IsZero returns true if the fingerprint is all zeros (unset).
@@ -67,24 +68,28 @@ func (f *FP) UnmarshalBinary(data []byte) error {
 	return nil
 }
 
-// ParseFP parses a hex-encoded fingerprint string.
+// ParseFP parses a fingerprint string in bech32 format (qc1...).
 func ParseFP(s string) (FP, error) {
 	var fp FP
 	if s == "" {
 		return fp, nil
 	}
-	b, err := hex.DecodeString(s)
+
+	hrp, data, err := Bech32Decode(s)
 	if err != nil {
-		return fp, fmt.Errorf("qconn: invalid fingerprint hex: %w", err)
+		return fp, fmt.Errorf("qconn: invalid fingerprint: %w", err)
 	}
-	if len(b) != fpSize {
-		return fp, FingerprintSizeError{Got: len(b)}
+	if hrp != FPPrefix {
+		return fp, fmt.Errorf("qconn: invalid fingerprint prefix: got %q, want %q", hrp, FPPrefix)
 	}
-	copy(fp[:], b)
+	if len(data) != fpSize {
+		return fp, FingerprintSizeError{Got: len(data)}
+	}
+	copy(fp[:], data)
 	return fp, nil
 }
 
-// MustParseFP parses a hex-encoded fingerprint string, panicking on error.
+// MustParseFP parses a bech32 fingerprint string, panicking on error.
 func MustParseFP(s string) FP {
 	fp, err := ParseFP(s)
 	if err != nil {

@@ -85,8 +85,7 @@ func ParseFP(s string) (FP, error) {
 	if len(data) != fpSize {
 		return fp, FingerprintSizeError{Got: len(data)}
 	}
-	copy(fp[:], data)
-	return fp, nil
+	return *(*FP)(data), nil
 }
 
 // MustParseFP parses a bech32 fingerprint string, panicking on error.
@@ -107,12 +106,9 @@ func FingerprintOf(cert *x509.Certificate) FP {
 }
 
 func FingerprintHash(raw []byte) FP {
-	var fp FP
 	h, _ := blake2b.New(fpSize, nil)
 	h.Write(raw)
-	s := h.Sum(nil)
-	copy(fp[:], s)
-	return fp
+	return *(*FP)(h.Sum(nil))
 }
 
 // EncodeCertPEM converts an x509 certificate to PEM format.

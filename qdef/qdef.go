@@ -66,6 +66,108 @@ type ConnectionObserver interface {
 	OnDeviceUpdate(id Identity, devices []DeviceInfo)
 }
 
+// MessageState represents the state of a message as it flows through the system.
+// States are linear and progress forward only.
+type MessageState int8
+
+const (
+	// MsgStateUnsent - Message created but not yet sent.
+	MsgStateUnsent MessageState = iota
+
+	// MsgStateSent - Message sent by client to server.
+	MsgStateSent
+
+	// MsgStateServerReceived - Server received the message.
+	MsgStateServerReceived
+
+	// MsgStateResolvedMachine - Server found the target machine.
+	MsgStateResolvedMachine
+
+	// MsgStateResolvedDevice - Server found the target device (if specified).
+	MsgStateResolvedDevice
+
+	// MsgStateSentToTarget - Server sent message to target client.
+	MsgStateSentToTarget
+
+	// MsgStateTargetAck - Target client acknowledged receipt (triggers job timeout).
+	MsgStateTargetAck
+
+	// MsgStateTargetResponse - Target client sent response.
+	MsgStateTargetResponse
+
+	// MsgStateForwardedResponse - Server forwarded response to sender.
+	MsgStateForwardedResponse
+
+	// MsgStateClientReceived - Sender client received the response.
+	MsgStateClientReceived
+)
+
+// MessageAction indicates the purpose of a message.
+type MessageAction int8
+
+const (
+	// MsgActionDeliver is a normal message delivery (request or response).
+	MsgActionDeliver MessageAction = iota
+
+	// MsgActionAck is an acknowledgment from the target.
+	// When received, the server transitions from resolution timeout to job timeout.
+	MsgActionAck
+
+	// MsgActionStatusUpdate is a status update from server to sender.
+	// Status updates inform the sender of message progress without completing the request.
+	MsgActionStatusUpdate
+)
+
+func (a MessageAction) String() string {
+	switch a {
+	case MsgActionDeliver:
+		return "deliver"
+	case MsgActionAck:
+		return "ack"
+	case MsgActionStatusUpdate:
+		return "status_update"
+	default:
+		return fmt.Sprintf("unknown(%d)", a)
+	}
+}
+
+func (s MessageState) String() string {
+	switch s {
+	case MsgStateUnsent:
+		return "unsent"
+	case MsgStateSent:
+		return "sent"
+	case MsgStateServerReceived:
+		return "server_received"
+	case MsgStateResolvedMachine:
+		return "resolved_machine"
+	case MsgStateResolvedDevice:
+		return "resolved_device"
+	case MsgStateSentToTarget:
+		return "sent_to_target"
+	case MsgStateTargetAck:
+		return "target_ack"
+	case MsgStateTargetResponse:
+		return "target_response"
+	case MsgStateForwardedResponse:
+		return "forwarded_response"
+	case MsgStateClientReceived:
+		return "client_received"
+	default:
+		return fmt.Sprintf("unknown(%d)", s)
+	}
+}
+
+// MessageObserver receives message lifecycle events for observability.
+type MessageObserver interface {
+	// OnMessageComplete is called when a message completes (success or failure).
+	// src is the sender identity, dest is the target address.
+	// lastState is the final state reached before completion or error.
+	// duration is the total time from server receipt to completion.
+	// err is nil on success, or the error that caused failure.
+	OnMessageComplete(src Identity, dest Addr, msgID MessageID, lastState MessageState, duration time.Duration, err error)
+}
+
 var (
 	// ErrCredentialsMissing is returned when the credential store has no valid client certificate.
 	ErrCredentialsMissing = fmt.Errorf("qconn: credentials missing")
@@ -82,6 +184,11 @@ var (
 	// ErrUnknownClient is returned when an operation references an unknown client fingerprint.
 	ErrUnknownClient = fmt.Errorf("qconn: unknown client")
 
+	// ErrDuplicateHostname is returned when authorizing a client whose hostname
+	// is already used by another authorized client. Hostnames must be unique
+	// among authorized clients because messages are routed by hostname.
+	ErrDuplicateHostname = fmt.Errorf("qconn: duplicate hostname")
+
 	// ErrRateLimited is returned when an operation is rejected due to rate limiting.
 	ErrRateLimited = fmt.Errorf("qconn: rate limited")
 
@@ -93,6 +200,9 @@ var (
 
 	// ErrNotHandled is returned by MessageRouter when it doesn't handle a target.
 	ErrNotHandled = fmt.Errorf("qconn: not handled")
+
+	// ErrInvalidAction is returned when a message has an invalid action for its context.
+	ErrInvalidAction = fmt.Errorf("qconn: invalid message action")
 
 	// ErrDecodeCSR is returned when a CSR PEM block cannot be decoded.
 	ErrDecodeCSR = fmt.Errorf("qconn: failed to decode CSR PEM")
@@ -261,6 +371,21 @@ func (e DeviceNotFoundError) Error() string {
 
 func (e DeviceNotFoundError) Unwrap() error {
 	return ErrDeviceNotFound
+}
+
+// DuplicateHostnameError is returned when authorizing a client whose hostname
+// is already used by another authorized client.
+type DuplicateHostnameError struct {
+	Hostname            string
+	ExistingFingerprint FP
+}
+
+func (e DuplicateHostnameError) Error() string {
+	return fmt.Sprintf("%s: hostname %q is already used by client %s", ErrDuplicateHostname, e.Hostname, e.ExistingFingerprint)
+}
+
+func (e DuplicateHostnameError) Unwrap() error {
+	return ErrDuplicateHostname
 }
 
 // ClientStatus represents the authorization state of a client.
@@ -466,6 +591,12 @@ type Message struct {
 	ReplyTo Addr            `json:"reply_to,omitempty"`
 	Error   string          `json:"error,omitempty"`
 	Payload cbor.RawMessage `json:"payload"`
+
+	// State is the current message state (used in status updates).
+	State MessageState `json:"state,omitempty"`
+
+	// Action indicates the purpose of this message (Deliver, Ack, StatusUpdate).
+	Action MessageAction `json:"action,omitempty"`
 }
 
 // ClientObserver receives lifecycle events and logs.

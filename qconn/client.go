@@ -536,21 +536,29 @@ func (c *Client) Request(ctx context.Context, target qdef.Addr, payload any, res
 		return msgID, err
 	}
 
-	// Wait for response (blocking read on this stream)
-	var respMsg qdef.Message
-	if err := ps.dec.Decode(&respMsg); err != nil {
-		return msgID, err
-	}
-
-	if respMsg.Error != "" {
-		return msgID, errors.New(respMsg.Error)
-	}
-	if response != nil {
-		if err := cbor.Unmarshal(respMsg.Payload, response); err != nil {
+	// Wait for response (blocking read on this stream).
+	// Skip status updates and wait for the final response.
+	for {
+		var respMsg qdef.Message
+		if err := ps.dec.Decode(&respMsg); err != nil {
 			return msgID, err
 		}
+
+		// Skip status updates - they're informational only.
+		if respMsg.Action == qdef.MsgActionStatusUpdate {
+			continue
+		}
+
+		if respMsg.Error != "" {
+			return msgID, errors.New(respMsg.Error)
+		}
+		if response != nil {
+			if err := cbor.Unmarshal(respMsg.Payload, response); err != nil {
+				return msgID, err
+			}
+		}
+		return msgID, nil
 	}
-	return msgID, nil
 }
 
 // Connection returns the current active connection. It may be nil.
@@ -772,6 +780,7 @@ func (c *Client) acceptLoop(ctx context.Context, conn *quic.Conn) {
 			defer func() { _ = stream.Close() }()
 
 			dec := qdef.NewDecoder(stream, 0) // Use default limit for client.
+			enc := cbor.NewEncoder(stream)
 			var msg qdef.Message
 			if err := dec.Decode(&msg); err != nil {
 				return
@@ -793,7 +802,18 @@ func (c *Client) acceptLoop(ctx context.Context, conn *quic.Conn) {
 					ID:    msg.ID,
 					Error: "client not authorized",
 				}
-				_ = cbor.NewEncoder(stream).Encode(errMsg)
+				_ = enc.Encode(errMsg)
+				return
+			}
+
+			// Send ack immediately to signal message receipt.
+			// This transitions the sender from resolution timeout to job timeout.
+			ackMsg := qdef.Message{
+				ID:     msg.ID,
+				Action: qdef.MsgActionAck,
+			}
+			if err := enc.Encode(ackMsg); err != nil {
+				c.logf("failed to send ack: %v", err)
 				return
 			}
 
@@ -812,7 +832,7 @@ func (c *Client) acceptLoop(ctx context.Context, conn *quic.Conn) {
 						respMsg.Payload = payload
 					}
 				}
-				if encErr := cbor.NewEncoder(stream).Encode(respMsg); encErr != nil {
+				if encErr := enc.Encode(respMsg); encErr != nil {
 					c.logf("failed to encode response: %v", encErr)
 				}
 			}

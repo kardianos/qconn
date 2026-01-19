@@ -259,9 +259,34 @@ func (m *InMemoryAuthorizationManager) ListClients(filter qmanage.ClientFilter) 
 }
 
 // SetClientStatus implements anex.ClientManager for testing.
+// When authorizing, checks that the hostname is not already used by another authorized client.
 func (m *InMemoryAuthorizationManager) SetClientStatus(fp qdef.FP, status qdef.ClientStatus) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Check hostname uniqueness when authorizing.
+	if status == qdef.StatusAuthorized {
+		rec, ok := m.clientRecords[fp]
+		if ok && rec.Hostname != "" {
+			now := time.Now()
+			for otherFP, otherRec := range m.clientRecords {
+				if otherFP == fp {
+					continue // Skip self.
+				}
+				// Only check active clients: authorized and not expired.
+				if otherRec.Status != qdef.StatusAuthorized {
+					continue
+				}
+				if !otherRec.ExpiresAt.IsZero() && now.After(otherRec.ExpiresAt) {
+					continue // Expired, doesn't count.
+				}
+				if otherRec.Hostname == rec.Hostname {
+					return qdef.DuplicateHostnameError{Hostname: rec.Hostname, ExistingFingerprint: otherFP}
+				}
+			}
+		}
+	}
+
 	fpStr := fp.String()
 	m.clients[fpStr] = status
 	if rec, ok := m.clientRecords[fp]; ok {

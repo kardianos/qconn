@@ -98,7 +98,13 @@ type Server struct {
 	activeConns map[qdef.FP]*quic.Conn     // fingerprint -> connection
 	identities  map[qdef.FP]*qdef.Identity // fingerprint -> identity
 	devices     map[qdef.FP]*machineInfo   // fingerprint -> devices (in-memory only, cleared on disconnect)
-	defaultWait time.Duration
+
+	// Timeout configuration.
+	resolutionTimeout time.Duration // Timeout for finding target and getting ack
+	jobTimeout        time.Duration // Timeout for job execution after ack
+
+	// Message observability.
+	messageObserver qdef.MessageObserver
 
 	// preAuthorized contains fingerprints to auto-authorize on connect.
 	// This is only used for bootstrap scenarios; never add to it at runtime.
@@ -155,9 +161,16 @@ type ServerOpt struct {
 	// Observers receive connection lifecycle events.
 	Observers []qdef.ConnectionObserver
 
-	// DefaultWait is the default timeout for routing messages to clients.
-	// If zero, defaults to 10 seconds.
-	DefaultWait time.Duration
+	// ResolutionTimeout is the timeout for finding the target machine/device and
+	// receiving the initial ack from the target. If zero, defaults to 10 seconds.
+	ResolutionTimeout time.Duration
+
+	// JobTimeout is the timeout for the job execution after the target acks receipt.
+	// If zero, defaults to 30 seconds.
+	JobTimeout time.Duration
+
+	// MessageObserver receives message lifecycle events for observability.
+	MessageObserver qdef.MessageObserver
 
 	// KeepAlivePeriod specifies how often to send QUIC keep-alive frames.
 	KeepAlivePeriod time.Duration
@@ -302,9 +315,13 @@ func NewServer(opt ServerOpt) (*Server, error) {
 		provMaxMsgSize = qdef.ProvisioningMaxMessageSize
 	}
 
-	defaultWait := opt.DefaultWait
-	if defaultWait <= 0 {
-		defaultWait = 10 * time.Second
+	resolutionTimeout := opt.ResolutionTimeout
+	if resolutionTimeout <= 0 {
+		resolutionTimeout = 10 * time.Second
+	}
+	jobTimeout := opt.JobTimeout
+	if jobTimeout <= 0 {
+		jobTimeout = 30 * time.Second
 	}
 
 	s = &Server{
@@ -322,11 +339,14 @@ func NewServer(opt ServerOpt) (*Server, error) {
 		provisioningMaxMessageSize: provMaxMsgSize,
 		cancel:                     cancel,
 		// Connection management
-		activeConns:   make(map[qdef.FP]*quic.Conn),
-		identities:    make(map[qdef.FP]*qdef.Identity),
-		devices:       make(map[qdef.FP]*machineInfo),
-		defaultWait:   defaultWait,
-		preAuthorized: make(map[qdef.FP]struct{}),
+		activeConns: make(map[qdef.FP]*quic.Conn),
+		identities:  make(map[qdef.FP]*qdef.Identity),
+		devices:     make(map[qdef.FP]*machineInfo),
+		// Timeouts
+		resolutionTimeout: resolutionTimeout,
+		jobTimeout:        jobTimeout,
+		messageObserver:   opt.MessageObserver,
+		preAuthorized:     make(map[qdef.FP]struct{}),
 		// Role definitions
 		roleDefs: make(map[string]qdef.RoleConfig),
 		// External integration
@@ -670,6 +690,14 @@ func (s *Server) handleStream(ctx context.Context, id qdef.Identity, stream *qui
 			return
 		}
 
+		// Validate message action - clients may only send Deliver messages to the server.
+		// Ack and StatusUpdate have specific directional flows and should never be sent
+		// by a client to the server as a request.
+		if msg.Action != qdef.MsgActionDeliver {
+			s.logf(id, "invalid message action %v from client (expected deliver), closing stream", msg.Action)
+			return
+		}
+
 		if provisioningCert {
 			msg.Target.Service = qdef.ServiceProvision
 		} else {
@@ -714,7 +742,7 @@ func (s *Server) handleStream(ctx context.Context, id qdef.Identity, stream *qui
 				senderID.Address = id.Address
 			}
 
-			respMsg, routeErr := s.route(ctx, senderID, msg)
+			respMsg, routeErr := s.route(ctx, senderID, msg, enc)
 			if routeErr != nil {
 				sendResponse(nil, routeErr)
 				continue
@@ -918,12 +946,58 @@ func (s *Server) hasDevice(fingerprint qdef.FP, deviceID string) bool {
 	return false
 }
 
-// route routes a message from a sender to a target client.
-func (s *Server) route(ctx context.Context, senderID qdef.Identity, msg qdef.Message) (*qdef.Message, error) {
-	deadline := time.Now().Add(s.defaultWait)
-	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
-		deadline = d
+// sendStatusUpdate sends a status update to the sender without completing the request.
+func (s *Server) sendStatusUpdate(enc *cbor.Encoder, msgID qdef.MessageID, state qdef.MessageState) {
+	if enc == nil {
+		return
 	}
+	update := qdef.Message{
+		ID:     msgID,
+		State:  state,
+		Action: qdef.MsgActionStatusUpdate,
+	}
+	_ = enc.Encode(&update) // Best effort; don't fail the request on status update errors.
+}
+
+// routeTracker tracks message state for observability.
+type routeTracker struct {
+	startTime time.Time
+	lastState qdef.MessageState
+	src       qdef.Identity
+	dest      qdef.Addr
+	msgID     qdef.MessageID
+}
+
+func (t *routeTracker) setState(state qdef.MessageState) {
+	t.lastState = state
+}
+
+// route routes a message from a sender to a target client.
+// The statusEnc is used to send status updates to the sender during routing.
+func (s *Server) route(ctx context.Context, senderID qdef.Identity, msg qdef.Message, statusEnc *cbor.Encoder) (*qdef.Message, error) {
+	tracker := &routeTracker{
+		startTime: time.Now(),
+		lastState: qdef.MsgStateServerReceived,
+		src:       senderID,
+		dest:      msg.Target,
+		msgID:     msg.ID,
+	}
+
+	// Ensure we report completion to the message observer.
+	var resultErr error
+	defer func() {
+		if s.messageObserver != nil {
+			s.messageObserver.OnMessageComplete(
+				tracker.src,
+				tracker.dest,
+				tracker.msgID,
+				tracker.lastState,
+				time.Since(tracker.startTime),
+				resultErr,
+			)
+		}
+	}()
+
 	// Try fingerprint-based auth first, fallback to role-based for bridge.
 	allowed, err := s.allowRole(senderID.Fingerprint, msg.Target.Type)
 	if err != nil || !allowed {
@@ -937,48 +1011,81 @@ func (s *Server) route(ctx context.Context, senderID qdef.Identity, msg qdef.Mes
 		}
 	}
 	if !allowed {
-		return nil, qdef.UnauthorizedRoleError{Roles: senderID.Roles, JobType: msg.Target.Type}
+		resultErr = qdef.UnauthorizedRoleError{Roles: senderID.Roles, JobType: msg.Target.Type}
+		return nil, resultErr
 	}
 
+	// Phase 1: Resolution with resolutionTimeout.
+	resolutionDeadline := time.Now().Add(s.resolutionTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(resolutionDeadline) {
+		resolutionDeadline = d
+	}
+
+	var targetConn *quic.Conn
 	for {
 		// First try local qconn clients.
 		conn, err := s.findTarget(msg.Target.Machine)
 		if err == nil {
-			// Check if sender has permission to send this job type.
-			if senderID.Fingerprint.IsZero() && len(senderID.Roles) == 0 {
-				return nil, fmt.Errorf("%w: sender fingerprint or roles required", qdef.ErrUnauthorized)
-			}
-
-			// Validate device ID if specified.
-			receiverFP := msg.Target.Machine
-			if msg.Target.Device != "" && !s.hasDevice(receiverFP, msg.Target.Device) {
-				return nil, qdef.DeviceNotFoundError{Machine: receiverFP, DeviceID: msg.Target.Device}
-			}
-
-			return s.forward(ctx, conn, msg)
+			targetConn = conn
+			tracker.setState(qdef.MsgStateResolvedMachine)
+			s.sendStatusUpdate(statusEnc, msg.ID, qdef.MsgStateResolvedMachine)
+			break
 		}
 
 		// Try MessageRouter for external targets (e.g., gRPC machines).
 		if s.messageRouter != nil {
 			resp, err := s.messageRouter.RouteMessage(ctx, senderID, msg)
 			if err == nil {
+				tracker.setState(qdef.MsgStateForwardedResponse)
 				return resp, nil
 			}
 			// If MessageRouter doesn't handle it, continue waiting for local client.
 			if !errors.Is(err, qdef.ErrNotHandled) {
-				return nil, err
+				resultErr = err
+				return nil, resultErr
 			}
+		}
+
+		// Check deadline before waiting.
+		if time.Now().After(resolutionDeadline) {
+			resultErr = qdef.TargetUnavailableError{Target: msg.Target}
+			return nil, resultErr
 		}
 
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(1 * time.Second):
-			if time.Now().After(deadline) {
-				return nil, qdef.TargetUnavailableError{Target: msg.Target}
-			}
+			resultErr = ctx.Err()
+			return nil, resultErr
+		case <-time.After(50 * time.Millisecond):
+			// Short poll interval for responsive timeout handling.
 		}
 	}
+
+	// Check if sender has permission to send this job type.
+	if senderID.Fingerprint.IsZero() && len(senderID.Roles) == 0 {
+		resultErr = fmt.Errorf("%w: sender fingerprint or roles required", qdef.ErrUnauthorized)
+		return nil, resultErr
+	}
+
+	// Validate device ID if specified.
+	if msg.Target.Device != "" {
+		if !s.hasDevice(msg.Target.Machine, msg.Target.Device) {
+			resultErr = qdef.DeviceNotFoundError{Machine: msg.Target.Machine, DeviceID: msg.Target.Device}
+			return nil, resultErr
+		}
+		tracker.setState(qdef.MsgStateResolvedDevice)
+		s.sendStatusUpdate(statusEnc, msg.ID, qdef.MsgStateResolvedDevice)
+	}
+
+	// Phase 2: Forward to target and wait for response.
+	resp, err := s.forward(ctx, targetConn, msg, tracker, statusEnc)
+	if err != nil {
+		resultErr = err
+		return nil, resultErr
+	}
+
+	tracker.setState(qdef.MsgStateForwardedResponse)
+	return resp, nil
 }
 
 func (s *Server) findTarget(fingerprint qdef.FP) (*quic.Conn, error) {
@@ -992,21 +1099,68 @@ func (s *Server) findTarget(fingerprint qdef.FP) (*quic.Conn, error) {
 	return val, nil
 }
 
-func (s *Server) forward(ctx context.Context, conn *quic.Conn, msg qdef.Message) (*qdef.Message, error) {
+// forward sends a message to the target and waits for ack + response.
+// It uses resolutionTimeout for the ack, then jobTimeout for the response.
+func (s *Server) forward(ctx context.Context, conn *quic.Conn, msg qdef.Message, tracker *routeTracker, statusEnc *cbor.Encoder) (*qdef.Message, error) {
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer stream.Close()
 
-	if err := cbor.NewEncoder(stream).Encode(msg); err != nil {
+	enc := cbor.NewEncoder(stream)
+	dec := cbor.NewDecoder(stream)
+
+	// Send message to target.
+	if err := enc.Encode(msg); err != nil {
 		return nil, err
+	}
+	tracker.setState(qdef.MsgStateSentToTarget)
+	s.sendStatusUpdate(statusEnc, msg.ID, qdef.MsgStateSentToTarget)
+
+	// Wait for ack with remaining resolution timeout.
+	ackDeadline := time.Now().Add(s.resolutionTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(ackDeadline) {
+		ackDeadline = d
 	}
 
+	// Read first response - should be ack or final response.
 	var resp qdef.Message
-	if err := cbor.NewDecoder(stream).Decode(&resp); err != nil {
-		return nil, err
+	ackCtx, ackCancel := context.WithDeadline(ctx, ackDeadline)
+	defer ackCancel()
+
+	// Set read deadline on the underlying stream for ack.
+	stream.SetReadDeadline(ackDeadline)
+
+	if err := dec.Decode(&resp); err != nil {
+		return nil, fmt.Errorf("waiting for ack: %w", err)
 	}
+
+	// Check if this is an ack.
+	if resp.Action == qdef.MsgActionAck {
+		tracker.setState(qdef.MsgStateTargetAck)
+		s.sendStatusUpdate(statusEnc, msg.ID, qdef.MsgStateTargetAck)
+
+		// Ack received - now wait for actual response with job timeout.
+		jobDeadline := time.Now().Add(s.jobTimeout)
+		if d, ok := ctx.Deadline(); ok && d.Before(jobDeadline) {
+			jobDeadline = d
+		}
+
+		stream.SetReadDeadline(jobDeadline)
+
+		// Reset resp to avoid leaking fields from the ack message.
+		resp = qdef.Message{}
+		if err := dec.Decode(&resp); err != nil {
+			return nil, fmt.Errorf("waiting for response: %w", err)
+		}
+	}
+
+	// Clear read deadline.
+	stream.SetReadDeadline(time.Time{})
+
+	tracker.setState(qdef.MsgStateTargetResponse)
+	_ = ackCtx // silence unused warning
 
 	return &resp, nil
 }
@@ -1024,7 +1178,7 @@ func (s *Server) Request(ctx context.Context, senderID qdef.Identity, target qde
 		Payload: rawPayload,
 	}
 
-	respMsg, err := s.route(ctx, senderID, msg)
+	respMsg, err := s.route(ctx, senderID, msg, nil) // No status updates for programmatic calls.
 	if err != nil {
 		return err
 	}

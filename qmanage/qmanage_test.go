@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -1023,3 +1024,246 @@ func (s *mockCredentialStore) SaveCredentials(certPEM, keyPEM []byte) error {
 	return nil
 }
 func (s *mockCredentialStore) OnUpdate() <-chan struct{} { return nil }
+
+// TestDuplicateHostnameRejection verifies that authorizing a client with a hostname
+// already used by another authorized client fails with ErrDuplicateHostname.
+func TestDuplicateHostnameRejection(t *testing.T) {
+	dir := t.TempDir()
+	auth, err := qmanage.NewAuthManager(qmanage.AuthManagerConfig{
+		AppName:         "test",
+		DataDir:         dir,
+		ServerHostname:  "localhost",
+		CleanupInterval: -1, // Disable cleanup.
+	})
+	if err != nil {
+		t.Fatalf("NewAuthManager: %v", err)
+	}
+	defer auth.Close()
+
+	// Create and authorize first client with hostname "shared-host".
+	csr1, _, err := qdef.CreateCSR("shared-host")
+	if err != nil {
+		t.Fatalf("CreateCSR: %v", err)
+	}
+	cert1PEM, err := auth.SignProvisioningCSR(csr1, "shared-host", []string{"role1"})
+	if err != nil {
+		t.Fatalf("SignProvisioningCSR: %v", err)
+	}
+	block1, _ := pem.Decode(cert1PEM)
+	leaf1, _ := x509.ParseCertificate(block1.Bytes)
+	fp1 := qdef.FingerprintOf(leaf1)
+
+	// Authorize first client - should succeed.
+	if err := auth.SetClientStatus(fp1, qdef.StatusAuthorized); err != nil {
+		t.Fatalf("SetClientStatus(fp1): %v", err)
+	}
+	t.Logf("First client authorized: %s", fp1)
+
+	// Create second client with same hostname "shared-host".
+	csr2, _, err := qdef.CreateCSR("shared-host")
+	if err != nil {
+		t.Fatalf("CreateCSR: %v", err)
+	}
+	cert2PEM, err := auth.SignProvisioningCSR(csr2, "shared-host", []string{"role2"})
+	if err != nil {
+		t.Fatalf("SignProvisioningCSR: %v", err)
+	}
+	block2, _ := pem.Decode(cert2PEM)
+	leaf2, _ := x509.ParseCertificate(block2.Bytes)
+	fp2 := qdef.FingerprintOf(leaf2)
+
+	// Authorize second client - should fail with duplicate hostname error.
+	err = auth.SetClientStatus(fp2, qdef.StatusAuthorized)
+	if err == nil {
+		t.Fatal("expected ErrDuplicateHostname, got nil")
+	}
+
+	var dupErr qdef.DuplicateHostnameError
+	if !errors.As(err, &dupErr) {
+		t.Fatalf("expected DuplicateHostnameError, got %T: %v", err, err)
+	}
+	if dupErr.Hostname != "shared-host" {
+		t.Errorf("expected hostname 'shared-host', got %q", dupErr.Hostname)
+	}
+	if dupErr.ExistingFingerprint != fp1 {
+		t.Errorf("expected existing fingerprint %s, got %s", fp1, dupErr.ExistingFingerprint)
+	}
+	t.Logf("Second client correctly rejected: %v", err)
+
+	// Verify second client is still unauthorized.
+	status, err := auth.GetStatus(fp2)
+	if err != nil {
+		t.Fatalf("GetStatus(fp2): %v", err)
+	}
+	if status != qdef.StatusUnauthorized {
+		t.Errorf("expected StatusUnauthorized, got %v", status)
+	}
+}
+
+// TestDuplicateHostnameAllowedAfterRevoke verifies that a hostname becomes available
+// again after the original client is revoked.
+func TestDuplicateHostnameAllowedAfterRevoke(t *testing.T) {
+	dir := t.TempDir()
+	auth, err := qmanage.NewAuthManager(qmanage.AuthManagerConfig{
+		AppName:         "test",
+		DataDir:         dir,
+		ServerHostname:  "localhost",
+		CleanupInterval: -1,
+	})
+	if err != nil {
+		t.Fatalf("NewAuthManager: %v", err)
+	}
+	defer auth.Close()
+
+	// Create and authorize first client.
+	csr1, _, err := qdef.CreateCSR("reusable-host")
+	if err != nil {
+		t.Fatalf("CreateCSR: %v", err)
+	}
+	cert1PEM, err := auth.SignProvisioningCSR(csr1, "reusable-host", []string{"role1"})
+	if err != nil {
+		t.Fatalf("SignProvisioningCSR: %v", err)
+	}
+	block1, _ := pem.Decode(cert1PEM)
+	leaf1, _ := x509.ParseCertificate(block1.Bytes)
+	fp1 := qdef.FingerprintOf(leaf1)
+
+	if err := auth.SetClientStatus(fp1, qdef.StatusAuthorized); err != nil {
+		t.Fatalf("SetClientStatus(fp1): %v", err)
+	}
+
+	// Revoke first client.
+	if err := auth.SetClientStatus(fp1, qdef.StatusRevoked); err != nil {
+		t.Fatalf("SetClientStatus(fp1, Revoked): %v", err)
+	}
+	t.Log("First client revoked")
+
+	// Create second client with same hostname.
+	csr2, _, err := qdef.CreateCSR("reusable-host")
+	if err != nil {
+		t.Fatalf("CreateCSR: %v", err)
+	}
+	cert2PEM, err := auth.SignProvisioningCSR(csr2, "reusable-host", []string{"role2"})
+	if err != nil {
+		t.Fatalf("SignProvisioningCSR: %v", err)
+	}
+	block2, _ := pem.Decode(cert2PEM)
+	leaf2, _ := x509.ParseCertificate(block2.Bytes)
+	fp2 := qdef.FingerprintOf(leaf2)
+
+	// Authorize second client - should succeed now that first is revoked.
+	if err := auth.SetClientStatus(fp2, qdef.StatusAuthorized); err != nil {
+		t.Fatalf("expected success after revoke, got: %v", err)
+	}
+	t.Log("Second client authorized after first was revoked")
+}
+
+// TestDuplicateHostnameAllowedAfterExpiry verifies that a hostname becomes available
+// again after the original client's certificate expires.
+func TestDuplicateHostnameAllowedAfterExpiry(t *testing.T) {
+	dir := t.TempDir()
+	auth, err := qmanage.NewAuthManager(qmanage.AuthManagerConfig{
+		AppName:         "test",
+		DataDir:         dir,
+		ServerHostname:  "localhost",
+		CleanupInterval: -1,
+	})
+	if err != nil {
+		t.Fatalf("NewAuthManager: %v", err)
+	}
+	defer auth.Close()
+
+	// Create and authorize first client.
+	csr1, _, err := qdef.CreateCSR("expiry-host")
+	if err != nil {
+		t.Fatalf("CreateCSR: %v", err)
+	}
+	cert1PEM, err := auth.SignProvisioningCSR(csr1, "expiry-host", []string{"role1"})
+	if err != nil {
+		t.Fatalf("SignProvisioningCSR: %v", err)
+	}
+	block1, _ := pem.Decode(cert1PEM)
+	leaf1, _ := x509.ParseCertificate(block1.Bytes)
+	fp1 := qdef.FingerprintOf(leaf1)
+
+	if err := auth.SetClientStatus(fp1, qdef.StatusAuthorized); err != nil {
+		t.Fatalf("SetClientStatus(fp1): %v", err)
+	}
+
+	// Expire the first client by setting expiry in the past.
+	if err := auth.SetClientExpiry(fp1, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatalf("SetClientExpiry: %v", err)
+	}
+	t.Log("First client expired")
+
+	// Create second client with same hostname.
+	csr2, _, err := qdef.CreateCSR("expiry-host")
+	if err != nil {
+		t.Fatalf("CreateCSR: %v", err)
+	}
+	cert2PEM, err := auth.SignProvisioningCSR(csr2, "expiry-host", []string{"role2"})
+	if err != nil {
+		t.Fatalf("SignProvisioningCSR: %v", err)
+	}
+	block2, _ := pem.Decode(cert2PEM)
+	leaf2, _ := x509.ParseCertificate(block2.Bytes)
+	fp2 := qdef.FingerprintOf(leaf2)
+
+	// Authorize second client - should succeed now that first is expired.
+	if err := auth.SetClientStatus(fp2, qdef.StatusAuthorized); err != nil {
+		t.Fatalf("expected success after expiry, got: %v", err)
+	}
+	t.Log("Second client authorized after first expired")
+}
+
+// TestDuplicateHostnameDifferentHostsAllowed verifies that different hostnames
+// are allowed to be authorized simultaneously.
+func TestDuplicateHostnameDifferentHostsAllowed(t *testing.T) {
+	dir := t.TempDir()
+	auth, err := qmanage.NewAuthManager(qmanage.AuthManagerConfig{
+		AppName:         "test",
+		DataDir:         dir,
+		ServerHostname:  "localhost",
+		CleanupInterval: -1,
+	})
+	if err != nil {
+		t.Fatalf("NewAuthManager: %v", err)
+	}
+	defer auth.Close()
+
+	// Create and authorize first client with hostname "host-a".
+	csr1, _, err := qdef.CreateCSR("host-a")
+	if err != nil {
+		t.Fatalf("CreateCSR: %v", err)
+	}
+	cert1PEM, err := auth.SignProvisioningCSR(csr1, "host-a", []string{"role1"})
+	if err != nil {
+		t.Fatalf("SignProvisioningCSR: %v", err)
+	}
+	block1, _ := pem.Decode(cert1PEM)
+	leaf1, _ := x509.ParseCertificate(block1.Bytes)
+	fp1 := qdef.FingerprintOf(leaf1)
+
+	if err := auth.SetClientStatus(fp1, qdef.StatusAuthorized); err != nil {
+		t.Fatalf("SetClientStatus(fp1): %v", err)
+	}
+
+	// Create and authorize second client with hostname "host-b".
+	csr2, _, err := qdef.CreateCSR("host-b")
+	if err != nil {
+		t.Fatalf("CreateCSR: %v", err)
+	}
+	cert2PEM, err := auth.SignProvisioningCSR(csr2, "host-b", []string{"role2"})
+	if err != nil {
+		t.Fatalf("SignProvisioningCSR: %v", err)
+	}
+	block2, _ := pem.Decode(cert2PEM)
+	leaf2, _ := x509.ParseCertificate(block2.Bytes)
+	fp2 := qdef.FingerprintOf(leaf2)
+
+	// Authorize second client - should succeed since hostname is different.
+	if err := auth.SetClientStatus(fp2, qdef.StatusAuthorized); err != nil {
+		t.Fatalf("expected success for different hostname, got: %v", err)
+	}
+	t.Log("Both clients authorized with different hostnames")
+}

@@ -521,6 +521,10 @@ func (m *BoltAuthManager) isCertExpiringSoon(cert *tls.Certificate) bool {
 // SetClientStatus updates a client's status.
 // If the client is pending (unauthorized in memory) and status is Authorized,
 // it is moved to the database. If status is Revoked, the pending client is deleted.
+//
+// When authorizing, the hostname must be unique among all authorized clients.
+// Returns ErrDuplicateHostname (or DuplicateHostnameError) if the hostname is already in use.
+// This check is performed atomically with the status update.
 func (m *BoltAuthManager) SetClientStatus(fp qdef.FP, status qdef.ClientStatus) error {
 	if fp.IsZero() {
 		return errors.New("missing fingerprint to set client status")
@@ -532,12 +536,44 @@ func (m *BoltAuthManager) SetClientStatus(fp qdef.FP, status qdef.ClientStatus) 
 	if isPending {
 		if status == qdef.StatusAuthorized {
 			// Move from pending to DB with authorized status.
+			// Check hostname uniqueness atomically.
+			hostname := pendingRec.Hostname
+
+			// Note: Pending clients are always unauthorized, so no need to check them.
+			// The check against DB authorized clients below is sufficient.
+
 			pendingRec.Status = status
 			delete(m.pendingClients, fp)
-			m.mu.Unlock()
 
+			// Check DB for duplicate hostname within transaction.
+			// Keep mutex held to ensure atomicity with pending client removal.
+			now := timeNow()
 			err := m.db.Update(func(tx *bbolt.Tx) error {
 				b := tx.Bucket(bucketClients)
+
+				// Check all active (authorized, non-expired) clients in DB for duplicate hostname.
+				if err := b.ForEach(func(k, v []byte) error {
+					var rec ClientRecord
+					if err := cbor.Unmarshal(v, &rec); err != nil {
+						return nil // Skip corrupted records.
+					}
+					// Only check active clients: authorized and not expired.
+					if rec.Status != qdef.StatusAuthorized {
+						return nil
+					}
+					if !rec.ExpiresAt.IsZero() && now.After(rec.ExpiresAt) {
+						return nil // Expired, doesn't count.
+					}
+					if rec.Hostname == hostname {
+						var existingFP qdef.FP
+						copy(existingFP[:], k)
+						return qdef.DuplicateHostnameError{Hostname: hostname, ExistingFingerprint: existingFP}
+					}
+					return nil
+				}); err != nil {
+					return err
+				}
+
 				data, err := cbor.Marshal(pendingRec)
 				if err != nil {
 					return err
@@ -545,8 +581,13 @@ func (m *BoltAuthManager) SetClientStatus(fp qdef.FP, status qdef.ClientStatus) 
 				return b.Put(fp[:], data)
 			})
 			if err != nil {
+				// Restore pending client on error (mutex still held).
+				pendingRec.Status = qdef.StatusUnauthorized
+				m.pendingClients[fp] = pendingRec
+				m.mu.Unlock()
 				return err
 			}
+			m.mu.Unlock()
 			m.triggerSignal(fp)
 			return nil
 		}
@@ -559,11 +600,14 @@ func (m *BoltAuthManager) SetClientStatus(fp qdef.FP, status qdef.ClientStatus) 
 	m.mu.Unlock()
 
 	// Client is not pending, update in DB.
+	now := timeNow()
 	err := m.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketClients)
 		data := b.Get(fp[:])
 		if data == nil {
 			// Create new record if it doesn't exist.
+			// Note: Creating a new authorized client without hostname shouldn't happen
+			// in normal flow, but we allow it for compatibility.
 			rec := ClientRecord{
 				Fingerprint: fp,
 				Status:      status,
@@ -580,6 +624,39 @@ func (m *BoltAuthManager) SetClientStatus(fp qdef.FP, status qdef.ClientStatus) 
 		if err := cbor.Unmarshal(data, &rec); err != nil {
 			return fmt.Errorf("unmarshal client record: %w", err)
 		}
+
+		// Check hostname uniqueness when authorizing.
+		if status == qdef.StatusAuthorized && rec.Status != qdef.StatusAuthorized {
+			hostname := rec.Hostname
+			if hostname != "" {
+				// Check all other active (authorized, non-expired) clients for duplicate hostname.
+				if err := b.ForEach(func(k, v []byte) error {
+					var otherFP qdef.FP
+					copy(otherFP[:], k)
+					if otherFP == fp {
+						return nil // Skip self.
+					}
+					var otherRec ClientRecord
+					if err := cbor.Unmarshal(v, &otherRec); err != nil {
+						return nil // Skip corrupted records.
+					}
+					// Only check active clients: authorized and not expired.
+					if otherRec.Status != qdef.StatusAuthorized {
+						return nil
+					}
+					if !otherRec.ExpiresAt.IsZero() && now.After(otherRec.ExpiresAt) {
+						return nil // Expired, doesn't count.
+					}
+					if otherRec.Hostname == hostname {
+						return qdef.DuplicateHostnameError{Hostname: hostname, ExistingFingerprint: otherFP}
+					}
+					return nil
+				}); err != nil {
+					return err
+				}
+			}
+		}
+
 		rec.Status = status
 		newData, err := cbor.Marshal(rec)
 		if err != nil {

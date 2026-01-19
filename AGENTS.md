@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
@@ -55,9 +55,69 @@ Unprovisioned clients use a shared secret (provision token) to generate a derive
 - Machine identity persists via certificate fingerprint (SHA-256 of cert raw bytes)
 - Certificates contain identity only; roles are managed server-side
 
+### Hostname Uniqueness
+- Hostnames must be unique among active (authorized, non-expired) clients
+- `SetClientStatus` checks atomically when authorizing; returns `ErrDuplicateHostname` on conflict
+- Revoked or expired clients don't count; their hostnames become available again
+- This ensures unambiguous message routing by hostname
+
 ### Role-Based Authorization (anex)
 - Roles define what job types a client can `Provide` (receive) and `SendsTo` (submit)
 - Authorization is by fingerprint only (no hostname fallback)
 - All message routing requires role authorization (no self-send bypass)
 - `list-machines`: requires `SendsTo` permission (common for discovery/broadcast)
 - `provision`: requires `SendsTo` permission (admin-only)
+
+### Message Protocol
+- `MessageState int8`: Linear state machine tracking message progress (Unsent → Sent → ServerReceived → ResolvedMachine → ResolvedDevice → SentToTarget → TargetAck → TargetResponse → ForwardedResponse → ClientReceived)
+- `MessageAction int8`: Purpose of message (Deliver=0, Ack=1, StatusUpdate=2)
+- Clients may only send `MsgActionDeliver` to server; server validates and closes streams for invalid actions
+- Server sends status updates to sender as message progresses through states
+- Target client sends Ack to server upon receiving message, triggering transition from resolution timeout to job timeout
+
+### Dual Timeout System
+- **Resolution Timeout**: Time to find target and receive ack (default configurable via `ServerOpt.ResolutionTimeout`)
+- **Job Timeout**: Time for target to respond after acking (default configurable via `ServerOpt.JobTimeout`)
+- Ack extends deadline from resolution to job timeout, allowing slow handlers without routing failures
+
+### MessageObserver
+Server accepts `MessageObserver` interface for monitoring message lifecycle and collecting metrics on routing performance.
+
+## Test Files
+
+### Key Test Files
+- `qconn/qconn_test.go`: Core connection lifecycle, migration, reliability tests
+- `qconn/timeout_test.go`: Dual timeout system, ack mechanism, status updates, invalid action validation
+- `qconn/expiry_test.go`: Certificate expiry detection and provisioning cert regeneration
+- `qconn/race_test.go`: Concurrent access and race condition tests
+- `qconn/clienthelper_test.go`: Generic handler registration and request/response helpers
+
+### Testing Patterns
+- Use `qmock.NewTestObserver` for tracking client state changes
+- Use `waitForState(t, observer, state, timeout)` to wait for specific client states
+- Raw QUIC connections can simulate misbehaving clients (see `TestInvalidAction_*` tests)
+- Time manipulation via `timeNow` variable for testing certificate expiry scenarios
+
+## Common Patterns
+
+### Adding a New Handler
+```go
+// In qdef package - register typed handler
+qdef.Handle(router, "service-type", func(ctx context.Context, id qdef.Identity, req *RequestType) (*ResponseType, error) {
+    // Handle request
+    return &ResponseType{...}, nil
+})
+```
+
+### Client Request with Type Safety
+```go
+// Using qclient helpers
+var response ResponseType
+_, err := qclient.Request(ctx, client, target, request, &response)
+```
+
+### Server Validation
+The server validates incoming messages in `handleStream()`:
+- Only `MsgActionDeliver` is accepted from clients
+- Invalid actions (Ack, StatusUpdate) cause stream closure and logging
+- This prevents protocol abuse from misbehaving clients

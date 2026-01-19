@@ -37,6 +37,14 @@ Clients can be in one of three statuses:
 - **Provisioned-Online**: Connected and ready for communication.
 - **Provisioned-Offline**: Authorized but currently disconnected.
 
+### Hostname Uniqueness
+Hostnames must be unique among active (authorized, non-expired) clients:
+- When authorizing a client, the server validates that no other active client uses the same hostname
+- This check is performed atomically with the authorization to prevent race conditions
+- Messages are routed by hostname, so duplicates would cause routing ambiguity
+- Once a client is revoked or its certificate expires, its hostname becomes available again
+- The server returns `ErrDuplicateHostname` if authorization would create a duplicate
+
 ## Security & Certificate Lifecycle
 
 ### mTLS & Fingerprinting
@@ -93,3 +101,44 @@ Admin functions use role-based authorization with different access levels:
 2. **Route**: `anex` determines the target machine's current connection.
 3. **Wait/Error**: If the target is unavailable, `anex` waits for a configurable period before returning an error to the submitter.
 4. **Respond**: If the target is available, the message is delivered, and the response (or error) is returned to the submitter.
+
+## Message Protocol
+
+### Message Actions
+Messages carry an `Action` field (`MessageAction int8`) that indicates their purpose:
+- **Deliver** (0): Normal message delivery from client to server for routing
+- **Ack** (1): Acknowledgment from target client that message was received
+- **StatusUpdate** (2): Progress notification from server to sender during routing
+
+Clients may only send messages with `Action=Deliver` to the server. The server validates this and closes streams from misbehaving clients that send Ack or StatusUpdate actions. Ack messages flow from target to server (during forwarding), and StatusUpdate messages flow from server to sender.
+
+### Message State Tracking
+Each message progresses through a linear state machine (`MessageState int8`):
+1. **Unsent**: Message created but not yet sent
+2. **Sent**: Message sent by client to server
+3. **ServerReceived**: Server received the message
+4. **ResolvedMachine**: Server found the target machine
+5. **ResolvedDevice**: Server found the target device (if specified)
+6. **SentToTarget**: Server sent message to target client
+7. **TargetAck**: Target client acknowledged receipt
+8. **TargetResponse**: Target client sent response
+9. **ForwardedResponse**: Server forwarded response to sender
+10. **ClientReceived**: Sender client received the response
+
+The server sends status updates to the sender as the message progresses, enabling real-time visibility into routing progress.
+
+### Dual Timeout System
+Message routing uses two distinct timeouts:
+- **Resolution Timeout**: Time allowed to find the target machine and receive an acknowledgment. Applies during states 1-6.
+- **Job Timeout**: Time allowed for the target to process and respond after acknowledging. Applies during states 7-8.
+
+When the target client receives a message, it immediately sends an Ack back to the server. This signals that the job has been accepted and extends the deadline from the resolution timeout to the job timeout. This prevents slow handler execution from being mistaken for routing failures.
+
+### MessageObserver Interface
+The server accepts a `MessageObserver` for monitoring message lifecycle:
+```go
+type MessageObserver interface {
+    OnMessageComplete(src Identity, dest Addr, msgID MessageID, lastState MessageState, duration time.Duration, err error)
+}
+```
+This enables metrics collection, logging, and debugging of message routing performance.

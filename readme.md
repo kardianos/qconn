@@ -5,7 +5,9 @@ All interfacing programs are clients. Each client may communicate with other cli
 All clients connect to a hub, which provides authentication, authorization, and encryption.
 All communication between clients is encrypted and authenticated over QUIC.
 
-Clients identify themselves using certificate fingerprints. When a client first connects, it goes through a provisioning process to obtain credentials. The client generates a private key locally and sends a certificate signing request to the server. The server signs the request and returns a certificate. This ensures private keys never leave the client machine. After provisioning, clients remain idle until an administrator explicitly authorizes them.
+Clients identify themselves using certificate fingerprints. When a client first connects, it goes through a provisioning process to obtain credentials. The client generates a private key locally and sends a certificate signing request to the server. The server signs the request and returns a certificate. This ensures private keys never leave the client machine.
+
+Provisioning grants only the ability to obtain mTLS certificates - it does not grant communication privileges. After provisioning, clients remain in an unauthenticated state and cannot send messages to other clients. An administrator must explicitly authorize each client before it can communicate. This two-step process (provision, then authorize) ensures that even if a provisioning token is compromised, attackers cannot communicate with existing clients without administrator approval.
 
 Each client has a hostname that must be unique among all authorized clients. When an administrator approves a client, the server checks that no other active client is using the same hostname. This check happens atomically with the authorization to prevent race conditions. If a hostname conflict is detected, the authorization fails and the client remains unauthorized. Once a client is revoked or its certificate expires, its hostname becomes available for reuse by another client.
 

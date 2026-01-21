@@ -32,10 +32,17 @@ Each provider client is identified by:
 A client starting up identifies itself by `Machine` and `Type`, and periodically updates its list of `Devices`.
 
 ### State Management
-Clients can be in one of three statuses:
-- **Unprovisioned**: Authenticated via token but lacking long-term credentials.
-- **Provisioned-Online**: Connected and ready for communication.
-- **Provisioned-Offline**: Authorized but currently disconnected.
+Clients have a persistent **status** and a connection **state**:
+
+**Status** (persisted in database):
+- **Unauthenticated**: Has mTLS certificate but not authorized to communicate
+- **Authenticated**: Authorized to communicate with other clients
+- **Revoked**: Certificate has been revoked, connection rejected
+
+**Connection State** (runtime only):
+- **Provisioning**: Obtaining initial mTLS certificate
+- **PendingAuth**: Connected but not yet authorized (status = Unauthenticated)
+- **Connected**: Fully authorized and ready for communication (status = Authenticated)
 
 ### Hostname Uniqueness
 Hostnames must be unique among active (authorized, non-expired) clients:
@@ -51,11 +58,20 @@ Hostnames must be unique among active (authorized, non-expired) clients:
 Security is based on Mutual TLS (mTLS) over QUIC. Every machine has a unique certificate fingerprint used for persistent identification regardless of address changes.
 
 ### Provisioning Security
-Provisioning tokens allow initial system connection but grant **no operational access**:
+Provisioning tokens **only** grant the ability to obtain mTLS certificates:
 - Provisioning clients can only call the provisioning endpoint
-- All other service calls are blocked at the transport layer
-- After provisioning, clients idle until authorized by an administrator
+- After provisioning, clients have `StatusUnauthenticated` and `StatePendingAuth`
+- **Provisioned clients cannot communicate** with other clients until authorized
+- Authorization must be granted separately via:
+  - **Auth token** (one-time bootstrap for initial admin setup)
+  - **Admin authorization** (`admin/client/auth` endpoint)
 - Authorization is granted per-fingerprint, never by hostname alone
+
+### Auth Tokens vs Provisioning Tokens
+- **Provisioning token**: Grants mTLS certificate issuance only. Does not grant communication.
+- **Auth token**: One-time use. Grants temporary authorization for bootstrap scenarios (e.g., first admin client). Created by server on first startup or via `CreateAuthToken()`.
+
+After the first admin client is authorized via auth token, all subsequent clients should be authorized via the `admin/client/auth` endpoint.
 
 ### Certificate Flow (CSR-Based)
 Private keys never leave the client:

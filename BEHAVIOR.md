@@ -182,10 +182,11 @@ With RBAC configured:
 - **Behavior:** Validates token, grants temp auth, changes state to Connected
 
 #### `update-client-info`
-- **Input:** `ClientInfoUpdate{MachineIP, Devices, MsgTypes}`
+- **Input:** `ClientInfoUpdate{MachineIP, Devices, MsgTypes, RequestedRoles}`
 - **Output:** None
 - **Behavior:** Updates client record, updates device routing tables
 - **Note:** Server sets `RemoteIP` from connection address
+- **Note:** `RequestedRoles` are stored but must be explicitly authorized via `admin/client/auth`
 
 **Tested:** `TestUpdateClientInfo`
 
@@ -539,6 +540,8 @@ This allows the server address to change during the provisioning flow if needed.
 | `Handler` | nil | Handler for incoming requests |
 | `Resolver` | nil | DNS resolver for hostname lookup |
 | `KeepalivePeriod` | 45s | QUIC keepalive interval |
+| `DefaultRoles` | nil | Roles to advertise to server (must be authorized separately) |
+| `DefaultRequestRole` | "" | Default role for `Request()` when role parameter is empty |
 
 ### BoltAuthConfig
 

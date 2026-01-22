@@ -106,10 +106,11 @@ type ClientStore interface {
 // ClientInfoUpdate contains fields that can be updated by the client.
 // Clients can update this even when unauthenticated to advertise their capabilities.
 type ClientInfoUpdate struct {
-	MachineIP string       `cbor:"1,keyasint,omitempty"`
-	RemoteIP  string       `cbor:"2,keyasint,omitempty"` // Set by server
-	Devices   []DeviceInfo `cbor:"3,keyasint,omitempty"`
-	MsgTypes  []string     `cbor:"4,keyasint,omitempty"` // Message types the client can handle
+	MachineIP      string       `cbor:"1,keyasint,omitempty"`
+	RemoteIP       string       `cbor:"2,keyasint,omitempty"` // Set by server
+	Devices        []DeviceInfo `cbor:"3,keyasint,omitempty"`
+	MsgTypes       []string     `cbor:"4,keyasint,omitempty"` // Message types the client can handle
+	RequestedRoles []string     `cbor:"5,keyasint,omitempty"` // Roles the client requests (must be authorized)
 }
 
 // AuthManager provides certificate operations.

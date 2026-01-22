@@ -86,13 +86,14 @@ type ClientRecord struct {
 	CreatedAt          time.Time    `cbor:"4,keyasint"`
 	ExpiresAt          time.Time    `cbor:"5,keyasint"`
 	UpdatedAt          time.Time    `cbor:"6,keyasint"`
-	MachineIP          string       `cbor:"7,keyasint,omitempty"` // Client's IP from its own perspective
-	RemoteIP           string       `cbor:"8,keyasint,omitempty"` // Client's IP from server's perspective
+	MachineIP          string       `cbor:"7,keyasint,omitempty"`  // Client's IP from its own perspective
+	RemoteIP           string       `cbor:"8,keyasint,omitempty"`  // Client's IP from server's perspective
 	Devices            []DeviceInfo `cbor:"9,keyasint,omitempty"`
 	MsgTypes           []string     `cbor:"10,keyasint,omitempty"` // Message types the client advertises it can handle
 	AuthorizedMsgTypes []string     `cbor:"11,keyasint,omitempty"` // Message types the client is authorized to handle
 	Roles              []string     `cbor:"12,keyasint,omitempty"` // Roles assigned to this client
 	Online             bool         `cbor:"13,keyasint,omitempty"` // Set by server based on connection state
+	RequestedRoles     []string     `cbor:"14,keyasint,omitempty"` // Roles the client requests (must be authorized)
 }
 
 // ClientRecordFilter specifies filter criteria for ListClientRecord.
@@ -797,6 +798,9 @@ func (m *BoltAuthManager) UpdateClientInfo(fp FP, info *ClientInfoUpdate) error 
 		}
 		if info.MsgTypes != nil {
 			rec.MsgTypes = info.MsgTypes
+		}
+		if info.RequestedRoles != nil {
+			rec.RequestedRoles = info.RequestedRoles
 		}
 		rec.UpdatedAt = now
 

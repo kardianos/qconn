@@ -69,7 +69,8 @@ type Client struct {
 	pending   map[MessageID]chan *Message
 	nextID    atomic.Uint64
 
-	handler Handler
+	handler            Handler
+	defaultRequestRole string
 
 	done chan struct{}
 }
@@ -92,6 +93,13 @@ type ClientOpt struct {
 
 	// KeepalivePeriod sets the QUIC keepalive interval.
 	KeepalivePeriod time.Duration
+
+	// DefaultRoles are the roles this client requests from the server.
+	// These are advertised to the server but must be explicitly authorized.
+	DefaultRoles []string
+
+	// DefaultRequestRole is the role used for Request() calls when role is empty.
+	DefaultRequestRole string
 }
 
 // NewClient creates and connects a new client.
@@ -174,13 +182,14 @@ func NewClient(ctx context.Context, opt ClientOpt) (*Client, error) {
 	}
 
 	c := &Client{
-		quicConn: quicConn,
-		stream:   stream,
-		enc:      cbor.NewEncoder(stream),
-		dec:      cbor.NewDecoder(stream),
-		pending:  make(map[MessageID]chan *Message),
-		handler:  opt.Handler,
-		done:     make(chan struct{}),
+		quicConn:           quicConn,
+		stream:             stream,
+		enc:                cbor.NewEncoder(stream),
+		dec:                cbor.NewDecoder(stream),
+		pending:            make(map[MessageID]chan *Message),
+		handler:            opt.Handler,
+		defaultRequestRole: opt.DefaultRequestRole,
+		done:               make(chan struct{}),
 	}
 
 	go c.readLoop(ctx)
@@ -196,9 +205,13 @@ func (c *Client) Close() error {
 
 // Request sends a request to a target and waits for response.
 // The role parameter is used for RBAC authorization checks on the server.
+// If role is empty, the client's DefaultRequestRole is used.
 // For system messages, role can be empty. For client-to-client messages with RBAC enabled,
 // role is required.
 func (c *Client) Request(ctx context.Context, target Target, typ string, role string, req, resp any) error {
+	if role == "" {
+		role = c.defaultRequestRole
+	}
 	id := MessageID(c.nextID.Add(1))
 
 	var payload []byte

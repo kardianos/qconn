@@ -87,6 +87,14 @@ Roles are managed **server-side only**:
 - Role lookups use fingerprint only; hostname fallback is not permitted
 - The hub is the trusted authority for role assignment
 
+### Requested vs Authorized Roles
+Clients can advertise which roles they want via `ClientOpt.DefaultRoles`:
+- **Requested roles** (`ClientRecord.RequestedRoles`): What the client advertises it wants
+- **Authorized roles** (`ClientRecord.Roles`): What the admin has granted
+- The two sets do not need to overlap - admin may grant different roles than requested
+- Clients include `RequestedRoles` in `update-client-info` for admin visibility
+- Admins explicitly set authorized roles via `admin/client/auth` or `admin/client/set-roles`
+
 ### Automated Renewal
 To minimize the exposure of revoked status, certificates have a short validity period:
 - **Default Validity**: 45 days (configurable).

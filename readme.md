@@ -1,24 +1,160 @@
 # qconn
 
-qconn aims to be a hub-spoke secure transport for real-time messages.
-All interfacing programs are clients. Each client may communicate with other clients as permitted by the hub.
-All clients connect to a hub, which provides authentication, authorization, and encryption.
-All communication between clients is encrypted and authenticated over QUIC.
+A hub-spoke secure transport for real-time messages over QUIC with mTLS authentication.
 
-Clients identify themselves using certificate fingerprints. When a client first connects, it goes through a provisioning process to obtain credentials. The client generates a private key locally and sends a certificate signing request to the server. The server signs the request and returns a certificate. This ensures private keys never leave the client machine.
+## Architecture
 
-Provisioning grants only the ability to obtain mTLS certificates - it does not grant communication privileges. After provisioning, clients remain in an unauthenticated state and cannot send messages to other clients. An administrator must explicitly authorize each client before it can communicate. This two-step process (provision, then authorize) ensures that even if a provisioning token is compromised, attackers cannot communicate with existing clients without administrator approval.
+```
+┌─────────┐     ┌─────────┐     ┌─────────┐
+│ Client  │────▶│ Server  │◀────│ Client  │
+└─────────┘     └─────────┘     └─────────┘
+     │               │               │
+     └───────────────┴───────────────┘
+           All traffic encrypted
+           via mTLS over QUIC
+```
 
-Each client has a hostname that must be unique among all authorized clients. When an administrator approves a client, the server checks that no other active client is using the same hostname. This check happens atomically with the authorization to prevent race conditions. If a hostname conflict is detected, the authorization fails and the client remains unauthorized. Once a client is revoked or its certificate expires, its hostname becomes available for reuse by another client.
+Clients connect to a central server which handles authentication, authorization, and message routing. Clients identify themselves via certificate fingerprints.
 
-Messages are addressed using a three-part tuple: service type, machine, and device. The service type indicates what kind of work the message relates to. The machine identifies the physical host by its certificate fingerprint. The device specifies a particular hardware unit or service instance on that machine. This addressing scheme allows flexible routing to specific endpoints across the network.
+### Addressing
 
-The server routes messages between clients based on role permissions. Each role defines which service types a client can provide and which types it can send messages to. Authorization checks happen on every message. A client cannot send messages to service types outside its permitted set, and it cannot receive messages for types it does not provide. Roles are managed entirely on the server side and are not embedded in client certificates.
+Messages use a three-part tuple: `(ServiceType, Machine, Device)`
+- **ServiceType**: Category of work (e.g., "print", "scan")
+- **Machine**: Host identified by certificate fingerprint or hostname
+- **Device**: Specific hardware/service instance on that machine
 
-When a message is sent, the server first locates the target machine and opens a stream to it. The target client acknowledges receipt of the message before processing it. This acknowledgment allows the server to distinguish between routing delays and processing delays. The system uses two separate timeouts: a resolution timeout for finding the target and receiving the acknowledgment, and a job timeout for waiting on the actual response after acknowledgment.
+## Provisioning & Authorization
 
-The server sends status updates back to the sender as a message progresses through the routing stages. These updates indicate when the target machine is found, when the message is forwarded, and when the target acknowledges it. This gives senders visibility into what is happening with their requests without needing to poll or guess about delays.
+Provisioning and authorization are **separate steps**:
 
-Certificates have short validity periods and renew automatically. Clients check their certificate expiration periodically and request renewal before expiration. This limits the window during which a revoked certificate could be misused. Once a certificate expires, any associated revocation records can be safely removed from the system.
+1. **Provisioning** - Client obtains mTLS certificate using a shared token
+   - Client generates keypair locally (private key never leaves client)
+   - Client sends CSR to server, receives signed certificate
+   - Client can now connect but **cannot communicate** with other clients
 
-The client maintains a persistent connection to the server and automatically reconnects if the connection drops. It handles DNS re-resolution so that if the server address changes, the client can find the new location. Connection migration allows the client to recover from network changes without losing its session state.
+2. **Authorization** - Admin grants communication privileges
+   - Via auth token (one-time bootstrap for first admin)
+   - Via `admin/client/auth` endpoint (standard method)
+
+This two-step process ensures compromised provisioning tokens cannot be used to communicate with existing clients.
+
+### Connection States
+
+| State | Description |
+|-------|-------------|
+| `StateProvisioning` | Requesting initial credentials |
+| `StatePendingAuth` | Has credentials, awaiting authorization |
+| `StateConnected` | Fully authorized |
+
+### Client Status (Persistent)
+
+| Status | Description |
+|--------|-------------|
+| `StatusUnauthenticated` | Provisioned but not authorized |
+| `StatusAuthenticated` | Authorized to connect |
+| `StatusRevoked` | Certificate revoked |
+
+## Role-Based Access Control
+
+Roles define message permissions:
+
+```go
+Roles: map[string]*RoleConfig{
+    "controller": {
+        Submit:  []string{"print", "scan"},  // Can send these types
+        Provide: []string{},                  // Cannot handle any
+    },
+    "printer": {
+        Submit:  []string{},                  // Cannot send
+        Provide: []string{"print", "scan"},   // Can handle these
+    },
+}
+```
+
+- Roles are managed server-side only (not embedded in certificates)
+- Without RBAC configured, authorized clients can communicate freely
+- With RBAC, every message requires matching Submit/Provide permissions
+
+## Certificate Lifecycle
+
+- **Validity**: 45 days default
+- **Renewal**: Automatic when 15 days remain
+- **Expiration cleanup**: Expired records can be safely removed
+- **Expired certificates**: Client automatically re-provisions (new fingerprint, requires admin re-approval)
+
+Hostnames must be unique among active clients. When a client is revoked or expires, its hostname becomes available for reuse.
+
+### Disconnected Client Recovery
+
+If a client is offline long enough for its certificate to expire:
+
+1. Client detects expired certificate on reconnect
+2. Client automatically re-provisions using the original provisioning token
+3. Client receives a **new certificate with new fingerprint**
+4. Admin re-authorizes with `qconn admin approve -fp <newFP>`
+
+No manual intervention is needed on the client machine.
+
+## Message Protocol
+
+Messages progress through states with status updates sent to the sender:
+
+```
+Client A → Server → Client B
+    │         │         │
+    │── Req ─▶│── Req ─▶│
+    │         │◀── Ack ─│
+    │◀─ Ack ──│         │
+    │         │◀─ Resp ─│
+    │◀─ Resp ─│         │
+```
+
+**Dual timeout system:**
+- **Resolution timeout**: Find target and receive acknowledgment
+- **Job timeout**: Target processes request after acknowledging
+
+Target handlers can call `ack(ctx)` to signal long-running operations and extend the timeout.
+
+## qstore Package
+
+Config file storage with platform-specific encryption.
+
+### DataStore Interface
+
+```go
+type DataStore interface {
+    Get(key string, decrypt bool) ([]byte, error)
+    Set(key string, encrypt bool, value []byte) error
+    Path() string
+}
+```
+
+### Config File Format
+
+```
+# Text values use T{...}
+server=T{localhost:9443}
+cert=T{
+-----BEGIN CERTIFICATE-----
+...
+-----END CERTIFICATE-----
+}
+
+# Binary values use B{...} with base64
+key=B{SGVsbG8gV29ybGQ=}
+```
+
+- Text encoding: printable ASCII without braces `{}`
+- Binary encoding: base64, line-wrapped at 60 chars for long values
+
+### Encryption
+
+- **Linux**: nacl/secretbox with embedded key
+- **Windows**: DPAPI
+
+### Default Paths
+
+| Platform | Admin | Service |
+|----------|-------|---------|
+| Linux | `~/.config/qconn/admin` | `/etc/qconn/client` |
+| Windows | `CU\SOFTWARE\qconn\admin` | `LM\SOFTWARE\qconn\client` |

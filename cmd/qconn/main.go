@@ -33,6 +33,8 @@ func main() {
 		cancel()
 	}()
 
+	os.Setenv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING", "1")
+
 	var err error
 	switch mode {
 	case "server":
@@ -59,7 +61,7 @@ func printUsage() {
 
 Modes:
   server          Start the qconn server
-  admin           Run admin operations (list, approve, revoke)
+  admin           Admin operations (auth, list, approve, revoke)
   time-provider   Start a client that provides a time endpoint
   time-consumer   Start a client that consumes the time endpoint
 
@@ -79,23 +81,6 @@ func runServerMode(ctx context.Context, args []string) error {
 		return err
 	}
 	return RunServer(ctx, opts)
-}
-
-func runAdminMode(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("admin", flag.ExitOnError)
-	opts := &AdminOptions{}
-	fs.StringVar(&opts.ServerAddr, "server", "127.0.0.1:9443", "Server address")
-	fs.StringVar(&opts.CredentialsDir, "creds", "./admin-creds", "Credentials directory")
-	fs.StringVar(&opts.ProvisionToken, "provision-token", "", "Provision token for initial setup")
-	fs.StringVar(&opts.AuthToken, "auth-token", "", "Auth token for self-authorization")
-	fs.StringVar(&opts.Command, "cmd", "list", "Command: list, approve, revoke")
-	fs.StringVar(&opts.TargetFP, "fp", "", "Target client fingerprint (for approve/revoke)")
-	fs.StringVar(&opts.RolesJSON, "roles", "", "JSON array of roles to assign (for approve)")
-	fs.StringVar(&opts.MsgTypesJSON, "msg-types", "", "JSON array of message types to authorize (for approve)")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	return RunAdmin(ctx, opts)
 }
 
 func runTimeProviderMode(ctx context.Context, args []string) error {

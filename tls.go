@@ -19,6 +19,7 @@ func BuildTLSConfig(auth AuthManager) *tls.Config {
 			return auth.VerifyClientCertificate(rawCerts)
 		},
 		NextProtos: []string{"qconn"},
+		Time:       timeNow, // Use fake time in tests
 	}
 }
 

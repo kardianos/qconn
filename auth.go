@@ -225,6 +225,10 @@ func NewBoltAuthManager(cfg BoltAuthConfig) (*BoltAuthManager, bool, error) {
 
 	// Setup provisioning tokens.
 	for _, token := range cfg.ProvisionTokens {
+		if len(token) < 12 {
+			db.Close()
+			return nil, false, ErrTokenTooShort
+		}
 		m.provisionTokens[token] = true
 
 		// Create derived CA for this token.
@@ -434,8 +438,9 @@ func (m *BoltAuthManager) VerifyClientCertificate(rawCerts [][]byte) error {
 	// Check for provisioning certificate.
 	if isProvisioningCert(leaf) {
 		opts := x509.VerifyOptions{
-			Roots:     m.provisioningPool,
-			KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+			Roots:       m.provisioningPool,
+			KeyUsages:   []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+			CurrentTime: timeNow(), // Use fake time in tests
 		}
 		if _, err := leaf.Verify(opts); err != nil {
 			return fmt.Errorf("qconn: invalid provisioning certificate: %w", err)
@@ -447,8 +452,9 @@ func (m *BoltAuthManager) VerifyClientCertificate(rawCerts [][]byte) error {
 	pool := x509.NewCertPool()
 	pool.AddCert(m.caCert)
 	opts := x509.VerifyOptions{
-		Roots:     pool,
-		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		Roots:       pool,
+		KeyUsages:   []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		CurrentTime: timeNow(), // Use fake time in tests
 	}
 	if _, err := leaf.Verify(opts); err != nil {
 		return fmt.Errorf("qconn: failed to verify client certificate: %w", err)

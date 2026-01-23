@@ -23,6 +23,11 @@ import (
 	"github.com/fxamacker/cbor/v2"
 )
 
+func TestMain(m *testing.M) {
+	os.Setenv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING", "1")
+	os.Exit(m.Run())
+}
+
 // mockClientRecord stores client status for testing.
 type mockClientRecord struct {
 	status             ClientStatus

@@ -342,6 +342,7 @@ var (
 	ErrNoClientCert          = errors.New("no client certificate provided")
 	ErrTimeout               = errors.New("request timeout")
 	ErrInvalidToken          = errors.New("invalid provisioning token")
+	ErrTokenTooShort         = errors.New("provisioning token must be at least 12 bytes")
 	ErrInvalidAuthToken      = errors.New("invalid authorization token")
 	ErrInvalidRequest        = errors.New("invalid request")
 	ErrInvalidTarget         = errors.New("invalid target: must specify machine, device, or type")

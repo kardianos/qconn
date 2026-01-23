@@ -732,3 +732,154 @@ func TestRenewalWithFakeTime(t *testing.T) {
 
 	t.Log("Old FP expired after time advance: OK")
 }
+
+// TestExpiredCertificateReProvisions verifies that a client with an expired certificate
+// automatically falls back to provisioning mode and can re-provision.
+func TestExpiredCertificateReProvisions(t *testing.T) {
+	// Set up fake time and restore after test.
+	fakeNow := time.Now()
+	cleanup := setFakeTime(&fakeNow)
+	defer cleanup()
+
+	// Use a long-lived context for the server to survive the entire test.
+	serverCtx, serverCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer serverCancel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Create temp directory for bbolt database.
+	tempDir, err := os.MkdirTemp("", "qconn-expiry-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	provisionToken := "test-provision-token"
+
+	// Create BoltAuthManager.
+	auth, _, err := NewBoltAuthManager(BoltAuthConfig{
+		DBPath:          filepath.Join(tempDir, "auth.db"),
+		ServerHostname:  "localhost",
+		ProvisionTokens: []string{provisionToken},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer auth.Close()
+
+	// Create auth token for authorization.
+	authToken, err := auth.CreateAuthToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create and start server.
+	server, err := NewServer(ServerOpt{
+		Auth:    auth,
+		Clients: auth,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	go func() {
+		_ = server.Serve(serverCtx, conn)
+	}()
+
+	serverAddr := conn.LocalAddr().String()
+
+	// Create client - provisions automatically.
+	clientCreds := NewMemoryCredentialStore(provisionToken, "test-client")
+	client, err := NewClient(ctx, ClientOpt{
+		ServerAddr: serverAddr,
+		Auth:       clientCreds,
+	})
+	if err != nil {
+		t.Fatalf("client failed: %v", err)
+	}
+
+	// Verify client provisioned and NeedsProvisioning is false.
+	if clientCreds.NeedsProvisioning() {
+		t.Fatal("client should not need provisioning after initial connection")
+	}
+
+	// Get the original fingerprint.
+	originalFP := clientCreds.Fingerprint()
+	t.Logf("Original FP: %s", originalFP)
+
+	// Get cert expiry time.
+	certPEM := clientCreds.CertPEM()
+	block, _ := pem.Decode(certPEM)
+	cert, _ := x509.ParseCertificate(block.Bytes)
+	t.Logf("Certificate expires at: %v", cert.NotAfter)
+
+	// Authorize the client.
+	if err := client.Request(ctx, System(), "self-authorize", "", &SelfAuthorizeRequest{Token: authToken}, nil); err != nil {
+		t.Fatalf("self-authorize failed: %v", err)
+	}
+
+	// Close the client.
+	if err := client.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	// Advance time past certificate expiry (certificates are valid for 45 days).
+	advanceFakeTime(46 * 24 * time.Hour)
+	t.Logf("Advanced time to: %v", timeNow())
+
+	// Verify NeedsProvisioning now returns true.
+	if !clientCreds.NeedsProvisioning() {
+		t.Fatal("client should need provisioning after certificate expired")
+	}
+
+	// Verify TLSConfig returns provisioning config (not expired cert).
+	tlsCfg, err := clientCreds.TLSConfig()
+	if err != nil {
+		t.Fatalf("TLSConfig failed: %v", err)
+	}
+	// Provisioning config uses a special server name derived from the token.
+	expectedServerName := ProvisioningServerName(provisionToken)
+	if tlsCfg.ServerName != expectedServerName {
+		t.Errorf("TLSConfig should return provisioning config, got ServerName=%q, want %q",
+			tlsCfg.ServerName, expectedServerName)
+	}
+
+	// Create a fresh context for reconnection (original context may be near expiry).
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel2()
+
+	// Reconnect - should automatically re-provision with a new certificate.
+	client2, err := NewClient(ctx2, ClientOpt{
+		ServerAddr: serverAddr,
+		Auth:       clientCreds,
+	})
+	if err != nil {
+		t.Fatalf("reconnect failed: %v", err)
+	}
+	defer func() { _ = client2.Close() }()
+
+	// Verify client re-provisioned (NeedsProvisioning should be false again).
+	if clientCreds.NeedsProvisioning() {
+		t.Fatal("client should not need provisioning after re-provision")
+	}
+
+	// Verify we got a new fingerprint.
+	newFP := clientCreds.Fingerprint()
+	t.Logf("New FP: %s", newFP)
+	if newFP == originalFP {
+		t.Error("fingerprint should have changed after re-provisioning")
+	}
+
+	// Note: The re-provisioned client would need admin re-authorization in production.
+	// The new fingerprint means the old authorization (tied to the old FP) doesn't apply.
+	// Admin workflow: run `qconn admin approve -fp <newFP>` to re-authorize.
+
+	t.Log("Expired certificate re-provisioning: OK")
+}

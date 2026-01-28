@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,9 +46,9 @@ type tempAuthRecord struct {
 // RoleConfig defines what message types a role can provide (handle) and submit (send).
 type RoleConfig struct {
 	// Provide lists message types this role can handle (receive requests for).
-	Provide []string
+	Provide []string `json:"provide,omitempty"`
 	// Submit lists message types this role can send (make requests for).
-	Submit []string
+	Submit []string `json:"submit,omitempty"`
 }
 
 // BoltAuthConfig configures the BoltAuthManager.
@@ -86,8 +87,8 @@ type ClientRecord struct {
 	CreatedAt          time.Time    `cbor:"4,keyasint"`
 	ExpiresAt          time.Time    `cbor:"5,keyasint"`
 	UpdatedAt          time.Time    `cbor:"6,keyasint"`
-	MachineIP          string       `cbor:"7,keyasint,omitempty"`  // Client's IP from its own perspective
-	RemoteIP           string       `cbor:"8,keyasint,omitempty"`  // Client's IP from server's perspective
+	MachineIP          string       `cbor:"7,keyasint,omitempty"` // Client's IP from its own perspective
+	RemoteIP           string       `cbor:"8,keyasint,omitempty"` // Client's IP from server's perspective
 	Devices            []DeviceInfo `cbor:"9,keyasint,omitempty"`
 	MsgTypes           []string     `cbor:"10,keyasint,omitempty"` // Message types the client advertises it can handle
 	AuthorizedMsgTypes []string     `cbor:"11,keyasint,omitempty"` // Message types the client is authorized to handle
@@ -98,6 +99,7 @@ type ClientRecord struct {
 
 // ClientRecordFilter specifies filter criteria for ListClientRecord.
 type ClientRecordFilter struct {
+	FP     *FP           // Filter by fingerprint (nil = any)
 	Status *ClientStatus // Filter by auth status (nil = any)
 	Online *bool         // Filter by online status (nil = any, applied post-merge by server)
 	Roles  []string      // Filter by roles (client has any of these, nil = any)
@@ -137,6 +139,16 @@ type provisionCertEntry struct {
 var _ AuthManager = (*BoltAuthManager)(nil)
 var _ ClientStore = (*BoltAuthManager)(nil)
 
+const minProvisionTokenSize = 12
+
+// ReservedHostnamePrefix is the prefix for reserved hostnames that clients cannot use.
+const ReservedHostnamePrefix = "$"
+
+var errMissingProvisionToken = fmt.Errorf("missing provisioning token, must be at least %d characters long", minProvisionTokenSize)
+
+// ErrReservedHostname is returned when a client tries to use a reserved hostname.
+var ErrReservedHostname = fmt.Errorf("hostname starting with %q is reserved", ReservedHostnamePrefix)
+
 // NewBoltAuthManager creates a new AuthManager backed by bbolt.
 // Returns the manager and a bool indicating if this is a new database (first init).
 // On first init, callers should use CreateAuthToken to generate tokens for initial
@@ -145,6 +157,20 @@ func NewBoltAuthManager(cfg BoltAuthConfig) (*BoltAuthManager, bool, error) {
 	dbPath := cfg.DBPath
 	if dbPath == "" {
 		dbPath = "auth.db"
+	}
+
+	var hasProvisionToken bool
+	for _, p := range cfg.ProvisionTokens {
+		if len(p) >= minProvisionTokenSize {
+			hasProvisionToken = true
+		}
+		if len(p) < minProvisionTokenSize {
+			return nil, false, errMissingProvisionToken
+		}
+	}
+
+	if !hasProvisionToken {
+		return nil, false, errMissingProvisionToken
 	}
 
 	// Ensure directory exists.
@@ -479,11 +505,11 @@ func generateAuthToken() (TA, error) {
 
 // CreateAuthToken creates a new auth token that must be redeemed within 24 hours.
 // Once redeemed, the authorization is valid for an additional 24 hours.
-// Returns the generated token string.
-func (m *BoltAuthManager) CreateAuthToken() (string, error) {
+// Returns the generated token.
+func (m *BoltAuthManager) CreateAuthToken() (TA, error) {
 	token, err := generateAuthToken()
 	if err != nil {
-		return "", err
+		return TA{}, err
 	}
 	rec := authTokenRecord{
 		Token:     token,
@@ -499,9 +525,9 @@ func (m *BoltAuthManager) CreateAuthToken() (string, error) {
 		return b.Put(token[:], data)
 	})
 	if err != nil {
-		return "", err
+		return TA{}, err
 	}
-	return token.String(), nil
+	return token, nil
 }
 
 // ValidAuthToken validates and redeems a self-authorization token.
@@ -509,16 +535,12 @@ func (m *BoltAuthManager) CreateAuthToken() (string, error) {
 // Once redeemed, the fingerprint is granted 24 hours of temporary authorization
 // for system commands only.
 // Returns the expiration time of the temporary authorization if valid.
-func (m *BoltAuthManager) ValidAuthToken(tokenText string, fp FP) (bool, time.Time, error) {
-	ta, err := ParseTA(tokenText)
-	if err != nil {
-		return false, time.Time{}, err
-	}
+func (m *BoltAuthManager) ValidAuthToken(ta TA, fp FP) (bool, time.Time, error) {
 	now := timeNow()
 	expiresAt := now.Add(24 * time.Hour)
 
 	var valid bool
-	err = m.db.Update(func(tx *bbolt.Tx) error {
+	err := m.db.Update(func(tx *bbolt.Tx) error {
 		// Check if token exists and is not expired.
 		tokenBucket := tx.Bucket(bucketAuthTokens)
 		data := tokenBucket.Get(ta[:])
@@ -599,6 +621,11 @@ func (m *BoltAuthManager) hasTempAuth(fp FP) (bool, error) {
 
 // SignProvisioningCSR signs a CSR for a new client.
 func (m *BoltAuthManager) SignProvisioningCSR(csrPEM []byte, hostname string) ([]byte, error) {
+	// Reject reserved hostnames.
+	if strings.HasPrefix(hostname, ReservedHostnamePrefix) {
+		return nil, ErrReservedHostname
+	}
+
 	certPEM, err := SignCSR(m.caCert, m.caKey, csrPEM, hostname, false)
 	if err != nil {
 		return nil, err
@@ -645,6 +672,10 @@ func (m *BoltAuthManager) SignProvisioningCSR(csrPEM []byte, hostname string) ([
 // SignRenewalCSR signs a CSR for certificate renewal.
 // The caller is responsible for checking client status and updating the client record.
 func (m *BoltAuthManager) SignRenewalCSR(csrPEM []byte, hostname string) ([]byte, error) {
+	// Reject reserved hostnames.
+	if strings.HasPrefix(hostname, ReservedHostnamePrefix) {
+		return nil, ErrReservedHostname
+	}
 	return SignCSR(m.caCert, m.caKey, csrPEM, hostname, false)
 }
 
@@ -1039,6 +1070,9 @@ func (m *BoltAuthManager) ListClientRecord(filter *ClientRecordFilter) ([]*Clien
 
 			// Apply filters.
 			if filter != nil {
+				if filter.FP != nil && rec.Fingerprint != *filter.FP {
+					return nil
+				}
 				if filter.Status != nil && rec.Status != *filter.Status {
 					return nil
 				}

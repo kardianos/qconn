@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
+	"github.com/kardianos/qconn/qstore"
 	"github.com/quic-go/quic-go"
 )
 
@@ -52,9 +53,9 @@ func (r *DNSResolver) Resolve(ctx context.Context, hostname string) (string, err
 	return net.JoinHostPort(addrs[0], r.Port), nil
 }
 
-// ClientAuthManager is an alias for CredentialStore for backwards compatibility.
-// Deprecated: Use CredentialStore instead.
-type ClientAuthManager = CredentialStore
+// SystemHandler handles system messages from the server.
+// Unlike regular handlers, system handlers don't send responses.
+type SystemHandler func(ctx context.Context, msg *Message)
 
 // Client connects to a qconn server.
 type Client struct {
@@ -70,7 +71,17 @@ type Client struct {
 	nextID    atomic.Uint64
 
 	handler            Handler
+	systemHandlers     map[string]SystemHandler
 	defaultRequestRole string
+
+	// store is used to persist configuration like provision tokens.
+	store qstore.DataStore
+	// auth is used for certificate renewal.
+	auth CredentialStore
+
+	stateMu   sync.RWMutex
+	state     ConnState
+	stateCond *sync.Cond
 
 	done chan struct{}
 }
@@ -79,10 +90,16 @@ type Client struct {
 type ClientOpt struct {
 	// ServerAddr is the server address to connect to.
 	// If Resolver is set, this is treated as a hostname to resolve.
+	// If empty and Store is set, retrieved from Store with key "server".
+	// Stored to Store on first use if provided.
 	ServerAddr string
 
 	// Auth manages client credentials.
-	Auth ClientAuthManager
+	Auth CredentialStore
+
+	// Store is an optional data store for persisting client configuration.
+	// Used to store/retrieve server address.
+	Store qstore.DataStore
 
 	// Handler processes incoming requests from other clients.
 	Handler Handler
@@ -109,14 +126,30 @@ func NewClient(ctx context.Context, opt ClientOpt) (*Client, error) {
 		return nil, ErrNoCert
 	}
 
-	// Resolve server address if resolver is configured.
+	// Resolve server address: use provided, or retrieve from store.
 	serverAddr := opt.ServerAddr
+	if serverAddr == "" && opt.Store != nil {
+		if data, err := opt.Store.Get("server", false); err == nil && len(data) > 0 {
+			serverAddr = string(data)
+		}
+	}
+	if serverAddr == "" {
+		return nil, fmt.Errorf("no server address configured")
+	}
+
+	// Store server address for future use if store is available.
+	if opt.Store != nil && opt.ServerAddr != "" {
+		_ = opt.Store.Set("server", false, []byte(opt.ServerAddr))
+	}
+
+	// Resolve server address if resolver is configured.
+	resolvedAddr := serverAddr
 	if opt.Resolver != nil {
-		resolved, err := opt.Resolver.Resolve(ctx, opt.ServerAddr)
+		resolved, err := opt.Resolver.Resolve(ctx, serverAddr)
 		if err != nil {
 			return nil, err
 		}
-		serverAddr = resolved
+		resolvedAddr = resolved
 	}
 
 	tlsCfg, err := opt.Auth.TLSConfig()
@@ -135,7 +168,7 @@ func NewClient(ctx context.Context, opt ClientOpt) (*Client, error) {
 		KeepAlivePeriod:    keepalive,
 	}
 
-	quicConn, err := quic.DialAddr(ctx, serverAddr, tlsCfg, quicConfig)
+	quicConn, err := quic.DialAddr(ctx, resolvedAddr, tlsCfg, quicConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -156,11 +189,11 @@ func NewClient(ctx context.Context, opt ClientOpt) (*Client, error) {
 
 		// Re-resolve in case address changed.
 		if opt.Resolver != nil {
-			resolved, err := opt.Resolver.Resolve(ctx, opt.ServerAddr)
+			resolved, err := opt.Resolver.Resolve(ctx, serverAddr)
 			if err != nil {
 				return nil, err
 			}
-			serverAddr = resolved
+			resolvedAddr = resolved
 		}
 
 		// Reconnect with new credentials.
@@ -169,7 +202,7 @@ func NewClient(ctx context.Context, opt ClientOpt) (*Client, error) {
 			return nil, err
 		}
 
-		quicConn, err = quic.DialAddr(ctx, serverAddr, tlsCfg, quicConfig)
+		quicConn, err = quic.DialAddr(ctx, resolvedAddr, tlsCfg, quicConfig)
 		if err != nil {
 			return nil, err
 		}
@@ -181,20 +214,116 @@ func NewClient(ctx context.Context, opt ClientOpt) (*Client, error) {
 		}
 	}
 
+	// Channel to signal when server has sent initial state notification.
+	ready := make(chan struct{})
+
+	enc := cbor.NewEncoder(stream)
+
+	// Send initial "connect" message to trigger server's AcceptStream.
+	// In QUIC, the server's AcceptStream only returns when the client sends data.
+	connectMsg := &Message{
+		ID:     1,
+		Action: ActionRequest,
+		Target: System(),
+		Type:   "connect",
+	}
+	if err := enc.Encode(connectMsg); err != nil {
+		quicConn.CloseWithError(1, "connect error")
+		return nil, err
+	}
+
 	c := &Client{
 		quicConn:           quicConn,
 		stream:             stream,
-		enc:                cbor.NewEncoder(stream),
+		enc:                enc,
 		dec:                cbor.NewDecoder(stream),
 		pending:            make(map[MessageID]chan *Message),
 		handler:            opt.Handler,
+		systemHandlers:     make(map[string]SystemHandler),
 		defaultRequestRole: opt.DefaultRequestRole,
+		store:              opt.Store,
+		auth:               opt.Auth,
+		state:              StatePendingAuth, // Initial state after connection
 		done:               make(chan struct{}),
 	}
+	c.stateCond = sync.NewCond(&c.stateMu)
+
+	// Register state-change handler that also signals readiness.
+	var readyOnce sync.Once
+	c.systemHandlers["state-change"] = func(ctx context.Context, msg *Message) {
+		c.handleStateChange(ctx, msg)
+		readyOnce.Do(func() { close(ready) })
+	}
+
+	// Register handler for provision token rotation.
+	c.systemHandlers["rotate-provision-token"] = c.handleRotateProvisionToken
+
+	// Register handler for certificate renewal trigger.
+	c.systemHandlers["trigger-renewal"] = c.handleTriggerRenewal
 
 	go c.readLoop(ctx)
 
+	// Wait for server to signal it has finished connection setup.
+	// This ensures the server has added us to s.conns before we return.
+	select {
+	case <-ready:
+	case <-ctx.Done():
+		c.Close()
+		return nil, ctx.Err()
+	}
+
 	return c, nil
+}
+
+// State returns the current connection state.
+func (c *Client) State() ConnState {
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+	return c.state
+}
+
+// IsConnected returns true if the client is in the connected (authorized) state.
+func (c *Client) IsConnected() bool {
+	return c.State() == StateConnected
+}
+
+// WaitForConnected blocks until the client reaches the connected state or the context is cancelled.
+// Returns nil if connected, or the context error if cancelled.
+func (c *Client) WaitForConnected(ctx context.Context) error {
+	// Use a polling approach with the condition variable
+	c.stateMu.Lock()
+	for c.state != StateConnected {
+		c.stateMu.Unlock()
+
+		// Check context
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		// Wait for state change with a short timeout
+		waitDone := make(chan struct{})
+		go func() {
+			c.stateMu.Lock()
+			c.stateCond.Wait()
+			c.stateMu.Unlock()
+			close(waitDone)
+		}()
+
+		select {
+		case <-waitDone:
+			// Continue to check state
+		case <-ctx.Done():
+			c.stateCond.Broadcast() // Wake up waiting goroutine
+			<-waitDone              // Wait for it to finish
+			return ctx.Err()
+		}
+
+		c.stateMu.Lock()
+	}
+	c.stateMu.Unlock()
+	return nil
 }
 
 // Close closes the client connection.
@@ -208,26 +337,22 @@ func (c *Client) Close() error {
 // If role is empty, the client's DefaultRequestRole is used.
 // For system messages, role can be empty. For client-to-client messages with RBAC enabled,
 // role is required.
-func (c *Client) Request(ctx context.Context, target Target, typ string, role string, req, resp any) error {
+func (c *Client) Request(ctx context.Context, target Target, role string, req Request, resp any) error {
 	if role == "" {
 		role = c.defaultRequestRole
 	}
 	id := MessageID(c.nextID.Add(1))
 
-	var payload []byte
-	if req != nil {
-		var err error
-		payload, err = cbor.Marshal(req)
-		if err != nil {
-			return err
-		}
+	payload, err := cbor.Marshal(req)
+	if err != nil {
+		return err
 	}
 
 	msg := &Message{
 		ID:      id,
 		Action:  ActionRequest,
 		Target:  target,
-		Type:    typ,
+		Type:    req.Type(),
 		Role:    role,
 		Payload: payload,
 	}
@@ -245,7 +370,7 @@ func (c *Client) Request(ctx context.Context, target Target, typ string, role st
 	}()
 
 	c.sendMu.Lock()
-	err := c.enc.Encode(msg)
+	err = c.enc.Encode(msg)
 	c.sendMu.Unlock()
 	if err != nil {
 		return err
@@ -292,11 +417,66 @@ func (c *Client) readLoop(ctx context.Context) {
 		case ActionResponse, ActionAck:
 			c.handleResponse(&msg)
 		case ActionRequest:
+			// Check for system messages.
+			if msg.Target.IsSystem() {
+				if handler, ok := c.systemHandlers[msg.Type]; ok {
+					handler(ctx, &msg)
+				}
+				continue
+			}
 			if err := c.handleRequest(ctx, &msg); err != nil {
 				return
 			}
 		}
 	}
+}
+
+func (c *Client) handleStateChange(_ context.Context, msg *Message) {
+	var notification StateChangeNotification
+	if err := cbor.Unmarshal(msg.Payload, &notification); err != nil {
+		return
+	}
+
+	c.stateMu.Lock()
+	c.state = notification.NewState
+	c.stateCond.Broadcast()
+	c.stateMu.Unlock()
+}
+
+func (c *Client) handleRotateProvisionToken(_ context.Context, msg *Message) {
+	if c.auth == nil {
+		return // No auth configured, can't save token
+	}
+
+	var notification RotateTokenNotification
+	if err := cbor.Unmarshal(msg.Payload, &notification); err != nil {
+		return
+	}
+
+	// Store the new provision token in the credential store.
+	_ = c.auth.SetProvisionToken(notification.Token)
+}
+
+func (c *Client) handleTriggerRenewal(ctx context.Context, msg *Message) {
+	if c.auth == nil {
+		return // No auth manager, can't renew
+	}
+
+	// Generate new CSR with current hostname.
+	csrPEM, keyPEM, err := CreateCSR(c.auth.Hostname())
+	if err != nil {
+		return
+	}
+
+	// Send renewal request to server.
+	req := RenewRequest{CSRPEM: csrPEM}
+	var resp RenewResponse
+	if err := c.Request(ctx, System(), "", &req, &resp); err != nil {
+		return
+	}
+
+	// Save new credentials. Pass nil for root CA since it doesn't change during renewal.
+	_ = c.auth.SaveCredentials(resp.CertPEM, keyPEM, nil)
 }
 
 func (c *Client) handleResponse(msg *Message) {
@@ -365,7 +545,8 @@ func (c *Client) sendResponse(id MessageID, payload []byte, errMsg string) error
 }
 
 // doProvisioning handles the provisioning protocol on an existing stream.
-func doProvisioning(ctx context.Context, stream *quic.Stream, auth ClientAuthManager) error {
+// The provision token is validated via TLS SNI during the handshake, not in this request.
+func doProvisioning(ctx context.Context, stream *quic.Stream, auth CredentialStore) error {
 	// Create CSR for the permanent hostname.
 	csrPEM, keyPEM, err := CreateCSR(auth.Hostname())
 	if err != nil {

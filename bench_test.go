@@ -8,6 +8,13 @@ import (
 	"testing"
 )
 
+// benchEchoRequest is used for benchmark echo tests.
+type benchEchoRequest struct {
+	Data []byte `cbor:"data"`
+}
+
+func (benchEchoRequest) Type() string { return "echo" }
+
 func BenchmarkClientRouting(b *testing.B) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -75,22 +82,19 @@ func BenchmarkClientRouting(b *testing.B) {
 
 	// Ensure client B is connected.
 	var clients []*ClientRecord
-	if err := clientB.Request(ctx, System(), "admin/client/list", "", nil, &clients); err != nil {
+	if err := clientB.Request(ctx, System(), "", &AdminClientListRequest{}, &clients); err != nil {
 		b.Fatal(err)
 	}
 
-	type testPayload struct {
-		Data []byte `cbor:"data"`
-	}
-	payload := testPayload{Data: make([]byte, 64)}
+	payload := benchEchoRequest{Data: make([]byte, 64)}
 
 	b.Run("SingleSender", func(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			var resp testPayload
-			if err := clientA.Request(ctx, ToMachine("client-b"), "echo", "", &payload, &resp); err != nil {
+			var resp benchEchoRequest
+			if err := clientA.Request(ctx, ToMachine("client-b"), "", &payload, &resp); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -132,10 +136,10 @@ func BenchmarkClientRouting(b *testing.B) {
 		defer func() { _ = clientD.Close() }()
 
 		// Ensure both are connected.
-		if err := clientC.Request(ctx, System(), "admin/client/list", "", nil, &clients); err != nil {
+		if err := clientC.Request(ctx, System(), "", &AdminClientListRequest{}, &clients); err != nil {
 			b.Fatal(err)
 		}
-		if err := clientD.Request(ctx, System(), "admin/client/list", "", nil, &clients); err != nil {
+		if err := clientD.Request(ctx, System(), "", &AdminClientListRequest{}, &clients); err != nil {
 			b.Fatal(err)
 		}
 
@@ -149,8 +153,8 @@ func BenchmarkClientRouting(b *testing.B) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < b.N; i++ {
-				var resp testPayload
-				if err := clientC.Request(ctx, ToMachine("client-d"), "echo", "", &payload, &resp); err != nil {
+				var resp benchEchoRequest
+				if err := clientC.Request(ctx, ToMachine("client-d"), "", &payload, &resp); err != nil {
 					b.Error(err)
 					return
 				}
@@ -161,8 +165,8 @@ func BenchmarkClientRouting(b *testing.B) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < b.N; i++ {
-				var resp testPayload
-				if err := clientD.Request(ctx, ToMachine("client-c"), "echo", "", &payload, &resp); err != nil {
+				var resp benchEchoRequest
+				if err := clientD.Request(ctx, ToMachine("client-c"), "", &payload, &resp); err != nil {
 					b.Error(err)
 					return
 				}

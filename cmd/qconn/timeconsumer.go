@@ -6,14 +6,19 @@ import (
 	"time"
 
 	"github.com/kardianos/qconn"
+	"github.com/kardianos/qconn/qexec"
 )
 
 // TimeConsumerOptions configures the time-consumer mode.
 type TimeConsumerOptions struct {
 	ServerAddr     string
-	CredentialsDir string
+	ConfigPath     string
 	ProvisionToken string
 	Hostname       string
+
+	// OnConnected is called when the client connects but before waiting for authorization.
+	// This allows callers to know when the client is ready to be approved.
+	OnConnected func(fp qconn.FP)
 }
 
 // RunTimeConsumer starts a client that consumes the time endpoint.
@@ -34,43 +39,31 @@ type TimeConsumerResult struct {
 
 // RunTimeConsumerWithResult queries the time service and returns the result.
 func RunTimeConsumerWithResult(ctx context.Context, opts *TimeConsumerOptions) (*TimeConsumerResult, error) {
-	hostname := opts.Hostname
-	if hostname == "" {
-		hostname = "time-consumer"
-	}
-
-	// Create credential store.
-	store, err := qconn.NewFileCredentialStore(qconn.ClientStoreConfig{
-		Dir:            opts.CredentialsDir,
-		Hostname:       hostname,
+	cmd := &CmdTimeConsumerRun{
+		ServerAddr:     opts.ServerAddr,
+		ConfigPath:     opts.ConfigPath,
 		ProvisionToken: opts.ProvisionToken,
-	})
+		Hostname:       opts.Hostname,
+		OnConnected:    opts.OnConnected,
+	}
+
+	responses := make(chan any)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- qexec.Execute(ctx, cmd, responses)
+	}()
+
+	var result *TimeConsumerResult
+	for resp := range responses {
+		switch r := resp.(type) {
+		case *RespTimeResult:
+			result = &TimeConsumerResult{Time: r.Time}
+		}
+	}
+
+	err := <-errCh
 	if err != nil {
-		return nil, fmt.Errorf("create credential store: %w", err)
+		return nil, err
 	}
-	defer store.Close()
-
-	// Connect to server.
-	client, err := qconn.NewClient(ctx, qconn.ClientOpt{
-		ServerAddr: opts.ServerAddr,
-		Auth:       store,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("connect to server: %w", err)
-	}
-	defer client.Close()
-
-	fmt.Printf("Time consumer connected as %s (FP: %s)\n", hostname, store.Fingerprint())
-
-	// Query time service by device type.
-	// The server will route to any client that provides this device type.
-	target := qconn.Target{DeviceType: "time-provider"}
-
-	var resp TimeResponse
-	// Specify the client's role for RBAC authorization.
-	if err := client.Request(ctx, target, "time", "time-consumer", nil, &resp); err != nil {
-		return nil, fmt.Errorf("request time: %w", err)
-	}
-
-	return &TimeConsumerResult{Time: resp.Time}, nil
+	return result, nil
 }

@@ -13,9 +13,10 @@ import (
 
 // Well-known keys used by ClientCredential for credential storage.
 const (
-	KeyCert = "cert" // Client certificate PEM
-	KeyKey  = "key"  // Client private key PEM
-	KeyCA   = "ca"   // CA certificate PEM
+	KeyCert  = "cert"  // Client certificate PEM
+	KeyKey   = "key"   // Client private key PEM
+	KeyCA    = "ca"    // CA certificate PEM
+	KeyToken = "token" // Provision token
 )
 
 // ClientCredential implements CredentialStore using a DataStore backend.
@@ -54,7 +55,18 @@ func NewClientCredential(cfg ClientCredentialConfig) (*ClientCredential, error) 
 	s := &ClientCredential{
 		store:    cfg.Store,
 		hostname: cfg.Hostname,
-		token:    cfg.ProvisionToken,
+	}
+
+	// Load or set the provision token.
+	if cfg.ProvisionToken != "" {
+		// Token provided in config - save it to store.
+		s.token = cfg.ProvisionToken
+		_ = cfg.Store.Set(KeyToken, false, []byte(cfg.ProvisionToken))
+	} else {
+		// Try to load token from store.
+		if data, err := cfg.Store.Get(KeyToken, false); err == nil && len(data) > 0 {
+			s.token = string(data)
+		}
 	}
 
 	// Try to load fingerprint and expiry from existing certificate.
@@ -137,9 +149,12 @@ func (s *ClientCredential) NeedsProvisioning() bool {
 	return timeNow().After(s.expiresAt)
 }
 
-// ProvisionToken returns the provisioning token.
-func (s *ClientCredential) ProvisionToken() string {
-	return s.token
+// SetProvisionToken updates the provisioning token (both in memory and persistent storage).
+func (s *ClientCredential) SetProvisionToken(token string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.token = token
+	return s.store.Set(KeyToken, false, []byte(token))
 }
 
 // Hostname returns the client's hostname for provisioning.
@@ -169,8 +184,11 @@ func (s *ClientCredential) SaveCredentials(certPEM, keyPEM, rootCAPEM []byte) er
 	if err := s.store.Set(KeyKey, true, keyPEM); err != nil {
 		return fmt.Errorf("save key: %w", err)
 	}
-	if err := s.store.Set(KeyCA, false, rootCAPEM); err != nil {
-		return fmt.Errorf("save ca: %w", err)
+	// Skip root CA update if nil (e.g., during renewal when CA hasn't changed).
+	if len(rootCAPEM) > 0 {
+		if err := s.store.Set(KeyCA, false, rootCAPEM); err != nil {
+			return fmt.Errorf("save ca: %w", err)
+		}
 	}
 
 	s.fingerprint = FingerprintOf(leaf)

@@ -105,8 +105,11 @@ func (m *MemoryCredentialStore) NeedsProvisioning() bool {
 	return timeNow().After(m.expiresAt)
 }
 
-func (m *MemoryCredentialStore) ProvisionToken() string {
-	return m.token
+func (m *MemoryCredentialStore) SetProvisionToken(token string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.token = token
+	return nil
 }
 
 func (m *MemoryCredentialStore) Hostname() string {

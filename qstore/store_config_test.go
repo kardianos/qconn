@@ -459,3 +459,96 @@ func TestConfigFileFormat(t *testing.T) {
 		t.Errorf("binary should use B{...} format, got:\n%s", s)
 	}
 }
+
+func TestNamespacedStore(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.conf")
+
+	// Create base store
+	baseStore, err := NewConfigDataStore(path)
+	if err != nil {
+		t.Fatalf("NewConfigDataStore() error = %v", err)
+	}
+
+	// Create namespaced stores
+	ns := NewNS(baseStore)
+	authStore := ns.Add("auth")
+	clientStore := ns.Add("client")
+
+	// Set values in different namespaces
+	if err := authStore.Set("cert", false, []byte("cert-data")); err != nil {
+		t.Fatalf("authStore.Set() error = %v", err)
+	}
+	if err := authStore.Set("key", false, []byte("key-data")); err != nil {
+		t.Fatalf("authStore.Set() error = %v", err)
+	}
+	if err := clientStore.Set("server", false, []byte("localhost:9443")); err != nil {
+		t.Fatalf("clientStore.Set() error = %v", err)
+	}
+	if err := clientStore.Set("provision-token", false, []byte("secret-token")); err != nil {
+		t.Fatalf("clientStore.Set() error = %v", err)
+	}
+
+	// Verify values can be read from namespaced stores
+	cert, err := authStore.Get("cert", false)
+	if err != nil {
+		t.Fatalf("authStore.Get() error = %v", err)
+	}
+	if string(cert) != "cert-data" {
+		t.Errorf("authStore.Get(cert) = %q, want %q", cert, "cert-data")
+	}
+
+	server, err := clientStore.Get("server", false)
+	if err != nil {
+		t.Fatalf("clientStore.Get() error = %v", err)
+	}
+	if string(server) != "localhost:9443" {
+		t.Errorf("clientStore.Get(server) = %q, want %q", server, "localhost:9443")
+	}
+
+	// Verify values are stored with prefixed keys in base store
+	authCert, err := baseStore.Get("auth/cert", false)
+	if err != nil {
+		t.Fatalf("baseStore.Get(auth/cert) error = %v", err)
+	}
+	if string(authCert) != "cert-data" {
+		t.Errorf("baseStore.Get(auth/cert) = %q, want %q", authCert, "cert-data")
+	}
+
+	clientServer, err := baseStore.Get("client/server", false)
+	if err != nil {
+		t.Fatalf("baseStore.Get(client/server) error = %v", err)
+	}
+	if string(clientServer) != "localhost:9443" {
+		t.Errorf("baseStore.Get(client/server) = %q, want %q", clientServer, "localhost:9443")
+	}
+
+	// Verify namespaces are isolated - auth can't see client's keys
+	missing, err := authStore.Get("server", false)
+	if err != nil {
+		t.Fatalf("authStore.Get(server) error = %v", err)
+	}
+	if missing != nil {
+		t.Errorf("authStore.Get(server) should be nil, got %q", missing)
+	}
+
+	// Verify Path() returns base path
+	if authStore.Path() != path {
+		t.Errorf("authStore.Path() = %q, want %q", authStore.Path(), path)
+	}
+
+	// Read file to verify key format
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(content)
+
+	// Should contain namespaced keys
+	if !strings.Contains(s, "auth/cert=") {
+		t.Errorf("file should contain auth/cert=, got:\n%s", s)
+	}
+	if !strings.Contains(s, "client/server=") {
+		t.Errorf("file should contain client/server=, got:\n%s", s)
+	}
+}

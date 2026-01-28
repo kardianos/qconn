@@ -2,15 +2,13 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
-
-	"github.com/kardianos/qconn"
 )
 
 func main() {
@@ -72,14 +70,37 @@ Run 'qconn <mode> -h' for mode-specific options.
 func runServerMode(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
 	opts := &ServerOptions{}
+	var genConfig bool
 	fs.StringVar(&opts.ListenAddr, "listen", "127.0.0.1:9443", "Address to listen on")
-	fs.StringVar(&opts.DataDir, "data", "./data", "Data directory for database")
-	fs.StringVar(&opts.ProvisionTokensJSON, "provision-tokens", "", "JSON array of provision tokens")
-	fs.StringVar(&opts.RolesJSON, "roles", "", `JSON role config. Schema: {"role": {"submit": [...], "provide": [...]}}
-    	Example: {"admin":{"submit":["admin/client/list","admin/client/auth","admin/client/revoke"]},"time-provider":{"provide":["time"]},"time-consumer":{"submit":["time"]}}`)
+	fs.StringVar(&opts.ConfigFile, "config", "config.json", "Path to JSON configuration file")
+	fs.BoolVar(&genConfig, "gen-config", false, "Generate a default config file to stdout or config flag if provided and exit")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+
+	// Generate config and exit if requested.
+	if genConfig {
+		var w io.Writer = os.Stdout
+		if len(opts.ConfigFile) > 0 {
+			f, err := os.OpenFile(opts.ConfigFile, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0600)
+			if err != nil {
+				return fmt.Errorf("unable to open config %q file to write to it: %w", opts.ConfigFile, err)
+			}
+			defer f.Close()
+
+			w = f
+		}
+		if err := writeDefaultConfig(w); err != nil {
+			return fmt.Errorf("generate config: %w", err)
+		}
+		return nil
+	}
+
+	// Config file is required for running the server.
+	if opts.ConfigFile == "" {
+		return fmt.Errorf("config file is required (-config)")
+	}
+
 	return RunServer(ctx, opts)
 }
 
@@ -87,7 +108,7 @@ func runTimeProviderMode(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("time-provider", flag.ExitOnError)
 	opts := &TimeProviderOptions{}
 	fs.StringVar(&opts.ServerAddr, "server", "127.0.0.1:9443", "Server address")
-	fs.StringVar(&opts.CredentialsDir, "creds", "./time-provider-creds", "Credentials directory")
+	fs.StringVar(&opts.ConfigPath, "config", "./time-provider.conf", "Config file path")
 	fs.StringVar(&opts.ProvisionToken, "provision-token", "", "Provision token for initial setup")
 	fs.StringVar(&opts.Hostname, "hostname", "time-provider", "Client hostname")
 	if err := fs.Parse(args); err != nil {
@@ -104,35 +125,11 @@ func runTimeConsumerMode(ctx context.Context, args []string) error {
 	}
 	opts := &TimeConsumerOptions{}
 	fs.StringVar(&opts.ServerAddr, "server", "127.0.0.1:9443", "Server address")
-	fs.StringVar(&opts.CredentialsDir, "creds", "./time-consumer-creds", "Credentials directory")
+	fs.StringVar(&opts.ConfigPath, "config", "./time-consumer.conf", "Config file path")
 	fs.StringVar(&opts.ProvisionToken, "provision-token", "", "Provision token for initial setup")
 	fs.StringVar(&opts.Hostname, "hostname", "time-consumer", "Client hostname")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	return RunTimeConsumer(ctx, opts)
-}
-
-// parseJSONStringSlice parses a JSON array of strings.
-func parseJSONStringSlice(s string) ([]string, error) {
-	if s == "" {
-		return nil, nil
-	}
-	var result []string
-	if err := json.Unmarshal([]byte(s), &result); err != nil {
-		return nil, fmt.Errorf("invalid JSON array: %w", err)
-	}
-	return result, nil
-}
-
-// parseRoles parses a JSON object mapping role names to role configs.
-func parseRoles(s string) (map[string]*qconn.RoleConfig, error) {
-	if s == "" {
-		return nil, nil
-	}
-	var result map[string]*qconn.RoleConfig
-	if err := json.Unmarshal([]byte(s), &result); err != nil {
-		return nil, fmt.Errorf("invalid roles JSON: %w", err)
-	}
-	return result, nil
 }

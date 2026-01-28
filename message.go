@@ -20,6 +20,11 @@ const AdminPrefix = "admin/"
 // Can only access admin prefix on system.
 const AdminRole = "admin"
 
+// Request is implemented by all request types to provide their message type.
+type Request interface {
+	Type() string
+}
+
 // Target identifies the destination for a message.
 // At least one of Machine, Device, or DeviceType must be set.
 // If Device is set, Machine must also be set.
@@ -270,6 +275,8 @@ type ProvisionRequest struct {
 	CSRPEM   []byte `cbor:"csr_pem"`
 }
 
+func (ProvisionRequest) Type() string { return "provision" }
+
 // ProvisionResponse contains the signed certificate.
 type ProvisionResponse struct {
 	CertPEM   []byte `cbor:"cert_pem"`
@@ -280,6 +287,8 @@ type ProvisionResponse struct {
 type RenewRequest struct {
 	CSRPEM []byte `cbor:"csr_pem"`
 }
+
+func (RenewRequest) Type() string { return "renew" }
 
 // RenewResponse contains the renewed certificate.
 type RenewResponse struct {
@@ -300,6 +309,13 @@ type RegisterDevicesRequest struct {
 	Devices []DeviceInfo `cbor:"devices"`
 }
 
+func (RegisterDevicesRequest) Type() string { return "register-devices" }
+
+// AdminClientListRequest requests the list of clients from the server.
+type AdminClientListRequest struct{}
+
+func (AdminClientListRequest) Type() string { return AdminPrefix + "client/list" }
+
 // AuthorizeClientRequest is sent by authorized clients to authorize another client by FP.
 type AuthorizeClientRequest struct {
 	FP       FP       `cbor:"fp"`
@@ -307,21 +323,29 @@ type AuthorizeClientRequest struct {
 	Roles    []string `cbor:"roles,omitempty"`     // Roles to assign to this client
 }
 
+func (AuthorizeClientRequest) Type() string { return AdminPrefix + "client/auth" }
+
 // SetClientRolesRequest is sent to update a client's roles.
 type SetClientRolesRequest struct {
 	FP    FP       `cbor:"fp"`
 	Roles []string `cbor:"roles"`
 }
 
+func (SetClientRolesRequest) Type() string { return AdminPrefix + "client/set-roles" }
+
 // RevokeClientRequest is sent by authorized clients to revoke another client.
 type RevokeClientRequest struct {
 	FP FP `cbor:"fp"`
 }
 
+func (RevokeClientRequest) Type() string { return AdminPrefix + "client/revoke" }
+
 // SelfAuthorizeRequest is sent by pending-auth clients to authorize themselves.
 type SelfAuthorizeRequest struct {
-	Token string `cbor:"token"`
+	Token TA `cbor:"token"`
 }
+
+func (SelfAuthorizeRequest) Type() string { return "self-authorize" }
 
 // StateChangeNotification is sent from server to client when the client's
 // connection state changes. The client should close the current stream
@@ -330,6 +354,29 @@ type StateChangeNotification struct {
 	NewState  ConnState `cbor:"1,keyasint"`
 	ExpiresAt time.Time `cbor:"2,keyasint,omitempty"`
 }
+
+// RotateTokenRequest is sent by admin to rotate a client's provision token.
+type RotateTokenRequest struct {
+	FP    FP     `cbor:"fp"`
+	Token string `cbor:"token"`
+}
+
+func (RotateTokenRequest) Type() string { return AdminPrefix + "client/rotate-token" }
+
+// RotateTokenNotification is sent from server to client with a new provision token.
+type RotateTokenNotification struct {
+	Token string `cbor:"token"`
+}
+
+// TriggerRenewalRequest is sent by admin to trigger certificate renewal on a client.
+type TriggerRenewalRequest struct {
+	FP FP `cbor:"fp"`
+}
+
+func (TriggerRenewalRequest) Type() string { return AdminPrefix + "client/trigger-renewal" }
+
+// TriggerRenewalNotification is sent from server to client to trigger certificate renewal.
+type TriggerRenewalNotification struct{}
 
 // Common errors.
 var (
@@ -352,4 +399,5 @@ var (
 	ErrClientRevoked         = errors.New("client revoked")
 	ErrInvalidCertificate    = errors.New("invalid certificate")
 	ErrDuplicateMachine      = errors.New("machine name already connected")
+	ErrRolesRequired         = errors.New("roles required for authorization")
 )

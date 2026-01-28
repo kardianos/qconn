@@ -28,6 +28,32 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// echoRequest is used for client-to-client echo tests.
+type echoRequest struct {
+	Message string `cbor:"message"`
+}
+
+func (echoRequest) Type() string { return "echo" }
+
+// slowRequest is used for slow handler tests.
+type slowRequest struct {
+	Message string `cbor:"message"`
+}
+
+func (slowRequest) Type() string { return "slow" }
+
+// printRequest is used for device routing tests.
+type printRequest struct {
+	Document string `cbor:"doc"`
+}
+
+func (printRequest) Type() string { return "print" }
+
+// scanRequest is used for device routing tests.
+type scanRequest struct{}
+
+func (scanRequest) Type() string { return "scan" }
+
 // mockClientRecord stores client status for testing.
 type mockClientRecord struct {
 	status             ClientStatus
@@ -49,7 +75,7 @@ type mockAuthManager struct {
 	caKey           *ecdsa.PrivateKey
 	serverCert      *tls.Certificate
 	provisionTokens map[string]bool
-	authTokens      map[string]bool
+	authTokens      map[TA]bool
 	clients         map[FP]*mockClientRecord
 
 	// Provisioning support.
@@ -93,7 +119,7 @@ func newMockAuthManager(t *testing.T) *mockAuthManager {
 		caCert:          caCert,
 		caKey:           caKey,
 		provisionTokens: make(map[string]bool),
-		authTokens:      make(map[string]bool),
+		authTokens:      make(map[TA]bool),
 		clients:         make(map[FP]*mockClientRecord),
 		provisionPool:   x509.NewCertPool(),
 		provisionCerts:  make(map[string]*mockProvisionCertEntry),
@@ -162,7 +188,7 @@ func (m *mockAuthManager) RootCertPool() *x509.CertPool {
 	return pool
 }
 
-func (m *mockAuthManager) ValidAuthToken(token string, fp FP) (bool, time.Time, error) {
+func (m *mockAuthManager) ValidAuthToken(token TA, fp FP) (bool, time.Time, error) {
 	if !m.authTokens[token] {
 		return false, time.Time{}, nil
 	}
@@ -203,10 +229,10 @@ func (m *mockAuthManager) SetProvisionTokens(tokens []string) {
 	}
 }
 
-func (m *mockAuthManager) SetAuthTokens(tokens []string) {
+func (m *mockAuthManager) SetAuthTokens(tokens []TA) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.authTokens = make(map[string]bool)
+	m.authTokens = make(map[TA]bool)
 	for _, t := range tokens {
 		m.authTokens[t] = true
 	}
@@ -325,6 +351,9 @@ func (m *mockAuthManager) ListClientRecord(filter *ClientRecordFilter) ([]*Clien
 		}
 		// Apply filters.
 		if filter != nil {
+			if filter.FP != nil && fp != *filter.FP {
+				continue
+			}
 			if filter.Status != nil && rec.status != *filter.Status {
 				continue
 			}
@@ -352,6 +381,11 @@ func (m *mockAuthManager) RootCertPEM() ([]byte, error) {
 }
 
 func (m *mockAuthManager) SignProvisioningCSR(csrPEM []byte, hostname string) ([]byte, error) {
+	// Reject reserved hostnames.
+	if strings.HasPrefix(hostname, ReservedHostnamePrefix) {
+		return nil, ErrReservedHostname
+	}
+
 	block, _ := pem.Decode(csrPEM)
 	if block == nil {
 		return nil, ErrInvalidRequest
@@ -541,7 +575,7 @@ func TestServerClientBasic(t *testing.T) {
 
 	// Test admin/client/list request.
 	var clients []*ClientRecord
-	err = client.Request(ctx, System(), "admin/client/list", "", nil, &clients)
+	err = client.Request(ctx, System(), "", &AdminClientListRequest{}, &clients)
 	if err != nil {
 		t.Fatalf("admin/client/list failed: %v", err)
 	}
@@ -620,25 +654,22 @@ func TestClientToClientRouting(t *testing.T) {
 
 	// Verify client B is connected by having it list clients too.
 	var clientsFromB []*ClientRecord
-	if err := clientB.Request(ctx, System(), "admin/client/list", "", nil, &clientsFromB); err != nil {
+	if err := clientB.Request(ctx, System(), "", &AdminClientListRequest{}, &clientsFromB); err != nil {
 		t.Fatalf("client B admin/client/list failed: %v", err)
 	}
 	t.Logf("Clients from B perspective: %+v", clientsFromB)
 
 	// Get list of clients to see what's registered.
 	var clients []*ClientRecord
-	if err := clientA.Request(ctx, System(), "admin/client/list", "", nil, &clients); err != nil {
+	if err := clientA.Request(ctx, System(), "", &AdminClientListRequest{}, &clients); err != nil {
 		t.Fatalf("admin/client/list failed: %v", err)
 	}
 	t.Logf("Connected clients: %+v", clients)
 
 	// Client A sends request to client B.
-	type testPayload struct {
-		Message string `cbor:"message"`
-	}
-	reqPayload := testPayload{Message: "hello from A"}
-	var respPayload testPayload
-	err = clientA.Request(ctx, ToMachine("client-b"), "echo", "", &reqPayload, &respPayload)
+	reqPayload := echoRequest{Message: "hello from A"}
+	var respPayload echoRequest
+	err = clientA.Request(ctx, ToMachine("client-b"), "", &reqPayload, &respPayload)
 	if err != nil {
 		t.Fatalf("request to client B failed: %v", err)
 	}
@@ -736,10 +767,10 @@ func TestBoltAuthManagerFullProvisioning(t *testing.T) {
 
 	// Verify clients are connected by issuing non-admin system requests.
 	// (Admin messages require temp auth or RBAC permission.)
-	if err := client1.Request(ctx, System(), "update-client-info", "", &ClientInfoUpdate{MachineIP: "10.0.0.1"}, nil); err != nil {
+	if err := client1.Request(ctx, System(), "", &ClientInfoUpdate{MachineIP: "10.0.0.1"}, nil); err != nil {
 		t.Fatalf("client1 update-client-info failed: %v", err)
 	}
-	if err := client2.Request(ctx, System(), "update-client-info", "", &ClientInfoUpdate{MachineIP: "10.0.0.2"}, nil); err != nil {
+	if err := client2.Request(ctx, System(), "", &ClientInfoUpdate{MachineIP: "10.0.0.2"}, nil); err != nil {
 		t.Fatalf("client2 update-client-info failed: %v", err)
 	}
 
@@ -789,22 +820,19 @@ func TestBoltAuthManagerFullProvisioning(t *testing.T) {
 	}
 
 	// Verify both clients reconnected successfully by issuing system requests.
-	if err := client1.Request(ctx, System(), "update-client-info", "", &ClientInfoUpdate{MachineIP: "10.0.0.1"}, nil); err != nil {
+	if err := client1.Request(ctx, System(), "", &ClientInfoUpdate{MachineIP: "10.0.0.1"}, nil); err != nil {
 		t.Fatalf("reconnected client1 update-client-info failed: %v", err)
 	}
-	if err := client2.Request(ctx, System(), "update-client-info", "", &ClientInfoUpdate{MachineIP: "10.0.0.2"}, nil); err != nil {
+	if err := client2.Request(ctx, System(), "", &ClientInfoUpdate{MachineIP: "10.0.0.2"}, nil); err != nil {
 		t.Fatalf("reconnected client2 update-client-info failed: %v", err)
 	}
 	t.Log("Both clients reconnected successfully")
 
 	// Client 1 sends message to client 2.
-	type testPayload struct {
-		Message string `cbor:"message"`
-	}
-	reqPayload := testPayload{Message: "hello from alpha to beta"}
-	var respPayload testPayload
+	reqPayload := echoRequest{Message: "hello from alpha to beta"}
+	var respPayload echoRequest
 
-	if err := client1.Request(ctx, ToMachine("client-beta"), "echo", "", &reqPayload, &respPayload); err != nil {
+	if err := client1.Request(ctx, ToMachine("client-beta"), "", &reqPayload, &respPayload); err != nil {
 		t.Fatalf("client1 -> client2 request failed: %v", err)
 	}
 
@@ -870,49 +898,41 @@ func TestBoltAuthManagerDuplicateMachine(t *testing.T) {
 	defer func() { _ = client1.Close() }()
 
 	// Verify client 1 is connected.
-	if err := client1.Request(ctx, System(), "update-client-info", "", &ClientInfoUpdate{MachineIP: "10.0.0.1"}, nil); err != nil {
+	if err := client1.Request(ctx, System(), "", &ClientInfoUpdate{MachineIP: "10.0.0.1"}, nil); err != nil {
 		t.Fatalf("client1 update-client-info failed: %v", err)
 	}
 
 	// Connect client 2 with the same hostname "same-machine".
-	// This should fail because the hostname is already in use.
+	// The server should replace client 1's connection with client 2
+	// (to support reconnection after provisioning with new cert).
 	auth2 := NewMemoryCredentialStore(provisionToken, "same-machine")
 	client2, err := NewClient(ctx, ClientOpt{
 		ServerAddr: serverAddr,
 		Auth:       auth2,
 	})
 	if err != nil {
-		// Connection itself might fail - this is acceptable.
-		t.Logf("client2 connection failed as expected: %v", err)
-	} else {
-		defer func() { _ = client2.Close() }()
+		t.Fatalf("client2 failed to connect: %v", err)
+	}
+	defer func() { _ = client2.Close() }()
 
-		// If connection succeeded, the first request should fail because
-		// the server closed the connection due to duplicate machine name.
-		// Use a short timeout since the connection should be closed quickly.
-		shortCtx, shortCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer shortCancel()
-
-		err = client2.Request(shortCtx, System(), "update-client-info", "", &ClientInfoUpdate{MachineIP: "10.0.0.2"}, nil)
-		if err == nil {
-			t.Fatal("expected client2 request to fail due to duplicate machine name, but it succeeded")
-		}
-		t.Logf("client2 request failed as expected: %v", err)
+	// Client 2 should work (it replaced client 1).
+	if err := client2.Request(ctx, System(), "", &ClientInfoUpdate{MachineIP: "10.0.0.2"}, nil); err != nil {
+		t.Fatalf("client2 request failed: %v", err)
 	}
 
-	// Verify client 1 is still working with a fresh context.
-	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer verifyCancel()
+	// Client 1's connection should have been closed by the server.
+	// A request should fail.
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer shortCancel()
 
-	if err := client1.Request(verifyCtx, System(), "update-client-info", "", &ClientInfoUpdate{MachineIP: "10.0.0.3"}, nil); err != nil {
-		t.Fatalf("client1 should still work after client2 rejection: %v", err)
+	err = client1.Request(shortCtx, System(), "", &ClientInfoUpdate{MachineIP: "10.0.0.3"}, nil)
+	if err == nil {
+		t.Fatal("expected client1 request to fail after being replaced, but it succeeded")
 	}
+	t.Logf("client1 request failed as expected after replacement: %v", err)
 }
 
 func TestSlowHandler(t *testing.T) {
-	type testPayload struct {
-		Message string `cbor:"message"`
-	}
 
 	// requestTimeout is 200ms.
 	// To test ack properly, we need a scenario where:
@@ -1022,14 +1042,14 @@ func TestSlowHandler(t *testing.T) {
 			defer func() { _ = clientB.Close() }()
 
 			var clients []*ClientRecord
-			if err := clientB.Request(ctx, System(), "admin/client/list", "", nil, &clients); err != nil {
+			if err := clientB.Request(ctx, System(), "", &AdminClientListRequest{}, &clients); err != nil {
 				t.Fatal(err)
 			}
 
-			reqPayload := testPayload{Message: "hello"}
-			var respPayload testPayload
+			reqPayload := slowRequest{Message: "hello"}
+			var respPayload slowRequest
 
-			err = clientA.Request(ctx, ToMachine("client-b"), "slow", "", &reqPayload, &respPayload)
+			err = clientA.Request(ctx, ToMachine("client-b"), "", &reqPayload, &respPayload)
 
 			if tc.expectTimeout {
 				if err == nil {
@@ -1059,7 +1079,9 @@ func TestSelfAuthorization(t *testing.T) {
 	defer cancel()
 
 	auth := newMockAuthManager(t)
-	auth.SetAuthTokens([]string{"secret-auth-token"})
+	validSecretAuth := TA{1, 2, 3}
+	invalidSecretAuth := TA{4, 5, 6}
+	auth.SetAuthTokens([]TA{validSecretAuth})
 
 	// Create server.
 	server, err := NewServer(ServerOpt{
@@ -1098,25 +1120,25 @@ func TestSelfAuthorization(t *testing.T) {
 
 	// Try to list clients - should fail because we're in pending-auth state.
 	var clients []*ClientRecord
-	err = client.Request(ctx, System(), "admin/client/list", "", nil, &clients)
+	err = client.Request(ctx, System(), "", &AdminClientListRequest{}, &clients)
 	if err == nil {
 		t.Fatal("expected error for pending-auth client calling admin/client/list")
 	}
 
 	// Self-authorize with invalid token - should fail.
-	err = client.Request(ctx, System(), "self-authorize", "", &SelfAuthorizeRequest{Token: "wrong-token"}, nil)
+	err = client.Request(ctx, System(), "", &SelfAuthorizeRequest{Token: invalidSecretAuth}, nil)
 	if err == nil {
 		t.Fatal("expected error for invalid auth token")
 	}
 
 	// Self-authorize with valid token - should succeed.
-	err = client.Request(ctx, System(), "self-authorize", "", &SelfAuthorizeRequest{Token: "secret-auth-token"}, nil)
+	err = client.Request(ctx, System(), "", &SelfAuthorizeRequest{Token: validSecretAuth}, nil)
 	if err != nil {
 		t.Fatalf("self-authorize failed: %v", err)
 	}
 
 	// Now list clients should work.
-	err = client.Request(ctx, System(), "admin/client/list", "", nil, &clients)
+	err = client.Request(ctx, System(), "", &AdminClientListRequest{}, &clients)
 	if err != nil {
 		t.Fatalf("admin/client/list failed after self-authorize: %v", err)
 	}
@@ -1175,7 +1197,7 @@ func TestAuthorizeClient(t *testing.T) {
 
 	// Verify admin is connected.
 	var clients []*ClientRecord
-	if err := adminClient.Request(ctx, System(), "admin/client/list", "", nil, &clients); err != nil {
+	if err := adminClient.Request(ctx, System(), "", &AdminClientListRequest{}, &clients); err != nil {
 		t.Fatalf("admin admin/client/list failed: %v", err)
 	}
 
@@ -1199,31 +1221,28 @@ func TestAuthorizeClient(t *testing.T) {
 	pendingFP := FingerprintOf(pendingCert)
 
 	// Pending client can't list clients (system endpoint).
-	err = pendingClient.Request(ctx, System(), "admin/client/list", "", nil, &clients)
+	err = pendingClient.Request(ctx, System(), "", &AdminClientListRequest{}, &clients)
 	if err == nil {
 		t.Fatal("expected error for pending client calling admin/client/list")
 	}
 
 	// Pending client can't send messages to other clients either.
-	type testPayload struct {
-		Message string `cbor:"message"`
-	}
-	reqPayload := testPayload{Message: "hello from pending"}
-	var respPayload testPayload
-	err = pendingClient.Request(ctx, ToMachine("admin-client"), "echo", "", &reqPayload, &respPayload)
+	reqPayload := echoRequest{Message: "hello from pending"}
+	var respPayload echoRequest
+	err = pendingClient.Request(ctx, ToMachine("admin-client"), "", &reqPayload, &respPayload)
 	if err == nil {
 		t.Fatal("expected error for pending client sending to another client")
 	}
 	t.Logf("Pending client routing error (expected): %v", err)
 
-	// Admin authorizes the pending client by FP.
-	err = adminClient.Request(ctx, System(), "admin/client/auth", "", &AuthorizeClientRequest{FP: pendingFP}, nil)
+	// Admin authorizes the pending client by FP with roles (roles required for auth).
+	err = adminClient.Request(ctx, System(), "", &AuthorizeClientRequest{FP: pendingFP, Roles: []string{"client"}}, nil)
 	if err != nil {
 		t.Fatalf("admin/client/auth failed: %v", err)
 	}
 
 	// Now pending client can list clients.
-	err = pendingClient.Request(ctx, System(), "admin/client/list", "", nil, &clients)
+	err = pendingClient.Request(ctx, System(), "", &AdminClientListRequest{}, &clients)
 	if err != nil {
 		t.Fatalf("admin/client/list failed after admin/client/auth: %v", err)
 	}
@@ -1232,7 +1251,7 @@ func TestAuthorizeClient(t *testing.T) {
 	}
 
 	// Now pending client can also send messages to other clients.
-	err = pendingClient.Request(ctx, ToMachine("admin-client"), "echo", "", &reqPayload, &respPayload)
+	err = pendingClient.Request(ctx, ToMachine("admin-client"), "", &reqPayload, &respPayload)
 	if err != nil {
 		t.Fatalf("request to admin failed after authorization: %v", err)
 	}
@@ -1249,8 +1268,9 @@ func TestBoltAuthManagerCleanup(t *testing.T) {
 	defer os.RemoveAll(tempDir)
 
 	auth, _, err := NewBoltAuthManager(BoltAuthConfig{
-		DBPath:         filepath.Join(tempDir, "auth.db"),
-		ServerHostname: "localhost",
+		DBPath:          filepath.Join(tempDir, "auth.db"),
+		ServerHostname:  "localhost",
+		ProvisionTokens: []string{"test-provision-secret-token"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1348,7 +1368,7 @@ func TestUpdateClientInfo(t *testing.T) {
 
 	// Verify client is connected.
 	var clients []*ClientRecord
-	if err := client.Request(ctx, System(), "admin/client/list", "", nil, &clients); err != nil {
+	if err := client.Request(ctx, System(), "", &AdminClientListRequest{}, &clients); err != nil {
 		t.Fatalf("admin/client/list failed: %v", err)
 	}
 
@@ -1365,7 +1385,7 @@ func TestUpdateClientInfo(t *testing.T) {
 			{Name: "scanner1", Type: "scanner"},
 		},
 	}
-	if err := client.Request(ctx, System(), "update-client-info", "", &updateInfo, nil); err != nil {
+	if err := client.Request(ctx, System(), "", &updateInfo, nil); err != nil {
 		t.Fatalf("update-client-info failed: %v", err)
 	}
 
@@ -1390,7 +1410,7 @@ func TestUpdateClientInfo(t *testing.T) {
 
 	// Verify devices are now routable by type.
 	var clientsWithDevices []*ClientRecord
-	if err := client.Request(ctx, System(), "admin/client/list", "", nil, &clientsWithDevices); err != nil {
+	if err := client.Request(ctx, System(), "", &AdminClientListRequest{}, &clientsWithDevices); err != nil {
 		t.Fatalf("admin/client/list failed: %v", err)
 	}
 
@@ -1477,7 +1497,7 @@ func TestDeviceTypeRouting(t *testing.T) {
 	defer func() { _ = printer.Close() }()
 
 	// Register printer with device type.
-	err = printer.Request(ctx, System(), "update-client-info", "", &ClientInfoUpdate{
+	err = printer.Request(ctx, System(), "", &ClientInfoUpdate{
 		Devices: []DeviceInfo{
 			{Name: "hp-printer-1", Type: "printer"},
 		},
@@ -1487,14 +1507,11 @@ func TestDeviceTypeRouting(t *testing.T) {
 	}
 
 	// Test 1: Route by device type.
-	type printReq struct {
-		Document string `cbor:"doc"`
-	}
 	type printResp struct {
 		Status string `cbor:"status"`
 	}
 	var resp printResp
-	err = sender.Request(ctx, ToType("printer"), "print", "", &printReq{Document: "test.pdf"}, &resp)
+	err = sender.Request(ctx, ToType("printer"), "", &printRequest{Document: "test.pdf"}, &resp)
 	if err != nil {
 		t.Fatalf("ToType(printer) request failed: %v", err)
 	}
@@ -1504,7 +1521,7 @@ func TestDeviceTypeRouting(t *testing.T) {
 	t.Log("Device type routing: OK")
 
 	// Test 2: Route to non-existent type.
-	err = sender.Request(ctx, ToType("scanner"), "scan", "", nil, nil)
+	err = sender.Request(ctx, ToType("scanner"), "", &scanRequest{}, nil)
 	if err == nil {
 		t.Fatal("expected error for non-existent device type")
 	}
@@ -1518,14 +1535,14 @@ func TestDeviceTypeRouting(t *testing.T) {
 	t.Log("Non-existent device type error: OK")
 
 	// Test 3: Route to specific device on machine.
-	err = sender.Request(ctx, ToDevice("printer-machine", "hp-printer-1"), "print", "", &printReq{Document: "another.pdf"}, &resp)
+	err = sender.Request(ctx, ToDevice("printer-machine", "hp-printer-1"), "", &printRequest{Document: "another.pdf"}, &resp)
 	if err != nil {
 		t.Fatalf("ToDevice request failed: %v", err)
 	}
 	t.Log("Specific device routing: OK")
 
 	// Test 4: Route to non-existent device on machine.
-	err = sender.Request(ctx, ToDevice("printer-machine", "nonexistent-device"), "print", "", nil, nil)
+	err = sender.Request(ctx, ToDevice("printer-machine", "nonexistent-device"), "", &printRequest{}, nil)
 	if err == nil {
 		t.Fatal("expected error for non-existent device")
 	}
@@ -1604,7 +1621,7 @@ func TestRevokedClientRejected(t *testing.T) {
 		defer reqCancel()
 
 		var clients []*ClientRecord
-		err = client.Request(reqCtx, System(), "admin/client/list", "", nil, &clients)
+		err = client.Request(reqCtx, System(), "", &AdminClientListRequest{}, &clients)
 		if err == nil {
 			t.Error("expected error for revoked client request")
 		}
@@ -1618,7 +1635,8 @@ func TestMessageSizeLimits(t *testing.T) {
 	defer cancel()
 
 	auth := newMockAuthManager(t)
-	auth.SetAuthTokens([]string{"auth-token"})
+	authToken := TA{2, 1, 3}
+	auth.SetAuthTokens([]TA{authToken})
 
 	// Server with small limits for testing.
 	server, err := NewServer(ServerOpt{
@@ -1659,7 +1677,7 @@ func TestMessageSizeLimits(t *testing.T) {
 		defer func() { _ = client.Close() }()
 
 		smallPayload := ClientInfoUpdate{MachineIP: "10.0.0.1"}
-		err = client.Request(ctx, System(), "update-client-info", "", &smallPayload, nil)
+		err = client.Request(ctx, System(), "", &smallPayload, nil)
 		if err != nil {
 			t.Fatalf("small message should work: %v", err)
 		}
@@ -1682,7 +1700,7 @@ func TestMessageSizeLimits(t *testing.T) {
 
 		// First send a small message to ensure connection works.
 		smallPayload := ClientInfoUpdate{MachineIP: "10.0.0.1"}
-		err = client.Request(ctx, System(), "update-client-info", "", &smallPayload, nil)
+		err = client.Request(ctx, System(), "", &smallPayload, nil)
 		if err != nil {
 			t.Fatalf("small message should work first: %v", err)
 		}
@@ -1694,7 +1712,7 @@ func TestMessageSizeLimits(t *testing.T) {
 		reqCtx, reqCancel := context.WithTimeout(ctx, 2*time.Second)
 		defer reqCancel()
 
-		err = client.Request(reqCtx, System(), "update-client-info", "", &largePayload, nil)
+		err = client.Request(reqCtx, System(), "", &largePayload, nil)
 		if err == nil {
 			t.Fatal("large message should fail")
 		}
@@ -1719,7 +1737,7 @@ func TestMessageSizeLimits(t *testing.T) {
 
 		mediumIP := string(make([]byte, 5000)) // 5KB
 		mediumPayload := ClientInfoUpdate{MachineIP: mediumIP}
-		err = client.Request(ctx, System(), "update-client-info", "", &mediumPayload, nil)
+		err = client.Request(ctx, System(), "", &mediumPayload, nil)
 		if err != nil {
 			t.Fatalf("medium message should work: %v", err)
 		}
@@ -1742,7 +1760,7 @@ func TestMessageSizeLimits(t *testing.T) {
 
 		// First a small message to confirm connection works.
 		smallPayload := ClientInfoUpdate{MachineIP: "10.0.0.1"}
-		err = client.Request(ctx, System(), "update-client-info", "", &smallPayload, nil)
+		err = client.Request(ctx, System(), "", &smallPayload, nil)
 		if err != nil {
 			t.Fatalf("small message should work first: %v", err)
 		}
@@ -1754,7 +1772,7 @@ func TestMessageSizeLimits(t *testing.T) {
 		reqCtx, reqCancel := context.WithTimeout(ctx, 2*time.Second)
 		defer reqCancel()
 
-		err = client.Request(reqCtx, System(), "update-client-info", "", &veryLargePayload, nil)
+		err = client.Request(reqCtx, System(), "", &veryLargePayload, nil)
 		if err == nil {
 			t.Fatal("very large message should fail")
 		}
@@ -1777,7 +1795,7 @@ func TestMessageSizeLimits(t *testing.T) {
 		defer func() { _ = client.Close() }()
 
 		// Self-authorize first (small message).
-		err = client.Request(ctx, System(), "self-authorize", "", &SelfAuthorizeRequest{Token: "auth-token"}, nil)
+		err = client.Request(ctx, System(), "", &SelfAuthorizeRequest{Token: authToken}, nil)
 		if err != nil {
 			t.Fatalf("self-authorize failed: %v", err)
 		}
@@ -1785,7 +1803,7 @@ func TestMessageSizeLimits(t *testing.T) {
 		// Now medium message should work (limit increased).
 		mediumIP := string(make([]byte, 5000)) // 5KB
 		mediumPayload := ClientInfoUpdate{MachineIP: mediumIP}
-		err = client.Request(ctx, System(), "update-client-info", "", &mediumPayload, nil)
+		err = client.Request(ctx, System(), "", &mediumPayload, nil)
 		if err != nil {
 			t.Fatalf("medium message after self-authorize should work: %v", err)
 		}
@@ -1872,7 +1890,7 @@ func TestDNSResolverChanges(t *testing.T) {
 		t.Logf("Resolver called %d times during provisioning", resolver.CallCount())
 
 		// Verify connected.
-		err = client.Request(ctx, System(), "update-client-info", "", &ClientInfoUpdate{MachineIP: "10.0.0.1"}, nil)
+		err = client.Request(ctx, System(), "", &ClientInfoUpdate{MachineIP: "10.0.0.1"}, nil)
 		if err != nil {
 			t.Fatalf("request failed: %v", err)
 		}
@@ -1914,7 +1932,7 @@ func TestDNSResolverChanges(t *testing.T) {
 		t.Logf("Resolver called %d times on reconnect", resolver.CallCount())
 
 		// Verify connected.
-		err = client.Request(ctx, System(), "update-client-info", "", &ClientInfoUpdate{MachineIP: "10.0.0.2"}, nil)
+		err = client.Request(ctx, System(), "", &ClientInfoUpdate{MachineIP: "10.0.0.2"}, nil)
 		if err != nil {
 			t.Fatalf("request failed: %v", err)
 		}
@@ -1971,7 +1989,7 @@ func TestDNSResolverChanges(t *testing.T) {
 		}
 
 		// Verify connected to server 1.
-		err = client1.Request(ctx, System(), "update-client-info", "", &ClientInfoUpdate{MachineIP: "10.0.0.1"}, nil)
+		err = client1.Request(ctx, System(), "", &ClientInfoUpdate{MachineIP: "10.0.0.1"}, nil)
 		if err != nil {
 			t.Fatalf("request to server 1 failed: %v", err)
 		}
@@ -1994,7 +2012,7 @@ func TestDNSResolverChanges(t *testing.T) {
 		defer func() { _ = client2.Close() }()
 
 		// Verify connected to server 2.
-		err = client2.Request(ctx, System(), "update-client-info", "", &ClientInfoUpdate{MachineIP: "10.0.0.2"}, nil)
+		err = client2.Request(ctx, System(), "", &ClientInfoUpdate{MachineIP: "10.0.0.2"}, nil)
 		if err != nil {
 			t.Fatalf("request to server 2 failed: %v", err)
 		}

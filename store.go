@@ -16,8 +16,9 @@ type CredentialStore interface {
 	// NeedsProvisioning returns true if the client needs to provision credentials.
 	NeedsProvisioning() bool
 
-	// ProvisionToken returns the provisioning token.
-	ProvisionToken() string
+	// SetProvisionToken updates the provisioning token (both in memory and persistent storage).
+	// Called when the server rotates the token.
+	SetProvisionToken(token string) error
 
 	// Hostname returns the client's hostname for provisioning.
 	Hostname() string

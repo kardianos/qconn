@@ -82,7 +82,7 @@ type ClientStore interface {
 	// Once used, the authorization granted by the token is only valid for 24 hours.
 	// Token-based authorization is ONLY valid for system (admin) messages.
 	// The Allow method should restrict any other use (e.g., client-to-client routing).
-	ValidAuthToken(token string, fp FP) (valid bool, expiresAt time.Time, err error)
+	ValidAuthToken(token TA, fp FP) (valid bool, expiresAt time.Time, err error)
 
 	// Allow checks if an action is permitted between originator and target.
 	// Called when a request is received or a response is sent.
@@ -112,6 +112,8 @@ type ClientInfoUpdate struct {
 	MsgTypes       []string     `cbor:"4,keyasint,omitempty"` // Message types the client can handle
 	RequestedRoles []string     `cbor:"5,keyasint,omitempty"` // Roles the client requests (must be authorized)
 }
+
+func (ClientInfoUpdate) Type() string { return "update-client-info" }
 
 // AuthManager provides certificate operations.
 type AuthManager interface {
@@ -261,19 +263,23 @@ func (s *Server) buildSystemHandlers() map[ConnState]map[string]serverHandler {
 			"provision-csr": s.handleProvision,
 		},
 		StatePendingAuth: {
+			"connect":            s.handleConnect, // Initial handshake message
 			"self-authorize":     s.handleSelfAuthorize,
 			"update-client-info": s.handleUpdateClientInfo, // Allow unauthenticated clients to advertise capabilities
 		},
 		StateConnected: {
+			"connect":            s.handleConnect, // Also allowed when already connected (reconnection)
 			"renew":              s.handleRenew,
 			"update-client-info": s.handleUpdateClientInfo,
 			"register-devices":   s.handleRegisterDevices,
 			"self-authorize":     s.handleSelfAuthorize, // Allow authenticated clients to get temp auth.
 
-			AdminPrefix + "client/list":      s.handleListClients,
-			AdminPrefix + "client/auth":      s.handleAuthorizeClient,
-			AdminPrefix + "client/set-roles": s.handleSetClientRoles,
-			AdminPrefix + "client/revoke":    s.handleRevokeClient,
+			AdminPrefix + "client/list":            s.handleListClients,
+			AdminPrefix + "client/auth":            s.handleAuthorizeClient,
+			AdminPrefix + "client/set-roles":       s.handleSetClientRoles,
+			AdminPrefix + "client/revoke":          s.handleRevokeClient,
+			AdminPrefix + "client/rotate-token":    s.handleRotateToken,
+			AdminPrefix + "client/trigger-renewal": s.handleTriggerRenewal,
 		},
 	}
 }
@@ -349,7 +355,7 @@ func (s *Server) handleConnection(ctx context.Context, quicConn *quic.Conn) {
 		}
 	}
 
-	// Accept stream from client
+	// Accept stream from client.
 	stream, err := quicConn.AcceptStream(ctx)
 	if err != nil {
 		quicConn.CloseWithError(2, "stream error")
@@ -371,13 +377,30 @@ func (s *Server) handleConnection(ctx context.Context, quicConn *quic.Conn) {
 	// Register connection - check for duplicate machine name
 	s.mu.Lock()
 	if existingFP, exists := s.machines[hostname]; exists && existingFP != fp {
-		s.mu.Unlock()
-		quicConn.CloseWithError(1, ErrDuplicateMachine.Error())
-		return
+		// Different FP for same hostname. Only reject if the existing connection is still active.
+		// This handles the case where a client reconnects with a new cert (e.g., after provisioning)
+		// before the old connection is fully cleaned up.
+		if existingConn, active := s.conns[existingFP]; active {
+			// Close the old connection to make room for the new one.
+			existingConn.quicConn.CloseWithError(1, "replaced by new connection")
+			delete(s.conns, existingFP)
+		}
 	}
 	s.conns[fp] = conn
 	s.machines[hostname] = fp
 	s.mu.Unlock()
+
+	// Send state notification to signal that server setup is complete.
+	// For authenticated clients, this signals they're ready to send requests.
+	// For unauthenticated clients, this signals they're connected and waiting for approval.
+	// Skip for provisioning clients - they use a different protocol flow.
+	if conn.state != StateProvisioning {
+		notification := StateChangeNotification{NewState: conn.state}
+		if err := s.sendSystemNotification(ctx, conn, "state-change", notification); err != nil {
+			quicConn.CloseWithError(1, err.Error())
+			return
+		}
+	}
 
 	// Run read loop
 	s.readLoop(ctx, conn)
@@ -632,6 +655,23 @@ func (s *Server) sendError(ctx context.Context, to *clientConn, id MessageID, er
 	return to.deliver(ctx, System(), resp)
 }
 
+// sendSystemNotification sends a system notification to a client.
+// The payload is CBOR-encoded internally.
+func (s *Server) sendSystemNotification(ctx context.Context, conn *clientConn, msgType string, payload any) error {
+	data, err := cbor.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	msg := &Message{
+		ID:      MessageID(s.nextID.Add(1)),
+		Action:  ActionRequest,
+		Target:  System(),
+		Type:    msgType,
+		Payload: data,
+	}
+	return conn.deliver(ctx, System(), msg)
+}
+
 func (s *Server) checkRouteTimeouts(ctx context.Context) {
 	ticker := time.NewTicker(s.requestTimeout / 4)
 	defer ticker.Stop()
@@ -687,6 +727,13 @@ func (s *Server) expireRoutes(ctx context.Context) error {
 }
 
 // System handlers
+
+// handleConnect is the initial handshake message sent by clients after opening a stream.
+// This triggers AcceptStream to return and allows the connection setup to complete.
+// The handler does nothing; the response is sent automatically.
+func (s *Server) handleConnect(ctx context.Context, conn *clientConn, msg *Message, w io.Writer, ack Ack) error {
+	return nil
+}
 
 func (s *Server) handleProvision(ctx context.Context, conn *clientConn, msg *Message, w io.Writer, ack Ack) error {
 	var req ProvisionRequest
@@ -900,6 +947,9 @@ func (s *Server) handleAuthorizeClient(ctx context.Context, conn *clientConn, ms
 	if err := cbor.Unmarshal(msg.Payload, &req); err != nil {
 		return ErrInvalidRequest
 	}
+	if len(req.Roles) == 0 {
+		return ErrRolesRequired
+	}
 	if err := ack(ctx); err != nil {
 		return err
 	}
@@ -919,11 +969,9 @@ func (s *Server) handleAuthorizeClient(ctx context.Context, conn *clientConn, ms
 		return err
 	}
 
-	// Set roles if provided.
-	if len(req.Roles) > 0 {
-		if err := s.clients.SetClientRoles(req.FP, req.Roles); err != nil {
-			return err
-		}
+	// Set roles (required).
+	if err := s.clients.SetClientRoles(req.FP, req.Roles); err != nil {
+		return err
 	}
 
 	// If the target is connected, update its state and notify it.
@@ -938,18 +986,7 @@ func (s *Server) handleAuthorizeClient(ctx context.Context, conn *clientConn, ms
 	// Send state change notification if connected.
 	if targetConn != nil {
 		notification := StateChangeNotification{NewState: StateConnected}
-		notifyPayload, err := cbor.Marshal(notification)
-		if err != nil {
-			return err
-		}
-		notifyMsg := &Message{
-			ID:      MessageID(s.nextID.Add(1)),
-			Action:  ActionRequest,
-			Target:  targetConn.target(),
-			Type:    "state-change",
-			Payload: notifyPayload,
-		}
-		return targetConn.deliver(ctx, System(), notifyMsg)
+		return s.sendSystemNotification(ctx, targetConn, "state-change", notification)
 	}
 
 	return nil
@@ -1039,4 +1076,70 @@ func (s *Server) handleUpdateClientInfo(ctx context.Context, conn *clientConn, m
 	}
 
 	return nil
+}
+
+func (s *Server) handleRotateToken(ctx context.Context, conn *clientConn, msg *Message, w io.Writer, ack Ack) error {
+	var req RotateTokenRequest
+	if err := cbor.Unmarshal(msg.Payload, &req); err != nil {
+		return ErrInvalidRequest
+	}
+
+	// Check target client exists.
+	rec, err := s.clients.GetClientRecord(req.FP)
+	if err != nil {
+		return err
+	}
+	if rec == nil {
+		return ErrNotConnected
+	}
+
+	// Target must be authenticated to receive the notification.
+	if rec.Status != StatusAuthenticated {
+		return ErrInvalidState
+	}
+
+	// Send rotation notification to target if connected.
+	s.mu.RLock()
+	targetConn := s.conns[req.FP]
+	s.mu.RUnlock()
+
+	if targetConn == nil {
+		return ErrNotConnected
+	}
+
+	notification := RotateTokenNotification{Token: req.Token}
+	return s.sendSystemNotification(ctx, targetConn, "rotate-provision-token", notification)
+}
+
+func (s *Server) handleTriggerRenewal(ctx context.Context, conn *clientConn, msg *Message, w io.Writer, ack Ack) error {
+	var req TriggerRenewalRequest
+	if err := cbor.Unmarshal(msg.Payload, &req); err != nil {
+		return ErrInvalidRequest
+	}
+
+	// Check target client exists.
+	rec, err := s.clients.GetClientRecord(req.FP)
+	if err != nil {
+		return err
+	}
+	if rec == nil {
+		return ErrNotConnected
+	}
+
+	// Target must be authenticated to receive the notification.
+	if rec.Status != StatusAuthenticated {
+		return ErrInvalidState
+	}
+
+	// Send renewal trigger to target if connected.
+	s.mu.RLock()
+	targetConn := s.conns[req.FP]
+	s.mu.RUnlock()
+
+	if targetConn == nil {
+		return ErrNotConnected
+	}
+
+	notification := TriggerRenewalNotification{}
+	return s.sendSystemNotification(ctx, targetConn, "trigger-renewal", notification)
 }

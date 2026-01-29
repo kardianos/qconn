@@ -115,9 +115,9 @@ func CreateCA() (caCert *x509.Certificate, caKey *ecdsa.PrivateKey, err error) {
 	now := timeNow()
 	template := &x509.Certificate{
 		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: "qconn Test CA"},
+		Subject:               pkix.Name{CommonName: "qconn CA"},
 		NotBefore:             now.Add(-time.Hour),
-		NotAfter:              now.Add(24 * time.Hour),
+		NotAfter:              now.AddDate(10, 0, 0), // 10 years
 		IsCA:                  true,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,

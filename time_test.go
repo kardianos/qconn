@@ -23,16 +23,27 @@ func init() {
 	}
 }
 
-// setFakeTime sets a fake time for testing. Pass nil to reset to real time.
+// resetFakeTime ensures fake time is cleared. Call at start of tests that don't use fake time
+// but might be affected by previous tests that didn't clean up properly.
+func resetFakeTime() {
+	timeMu.Lock()
+	fakeTime = nil
+	timeMu.Unlock()
+}
+
+// setFakeTime sets a fake time for testing.
 // Returns a cleanup function that restores real time.
+// A test can call setFakeTime multiple times to update the value.
+// Only the cleanup from the FIRST call should be used (via defer).
 func setFakeTime(t *time.Time) func() {
 	timeMu.Lock()
-	defer timeMu.Unlock()
 	fakeTime = t
+	timeMu.Unlock()
+
 	return func() {
 		timeMu.Lock()
-		defer timeMu.Unlock()
 		fakeTime = nil
+		timeMu.Unlock()
 	}
 }
 

@@ -266,6 +266,7 @@ func (s *Server) buildSystemHandlers() map[ConnState]map[string]serverHandler {
 			"connect":            s.handleConnect, // Initial handshake message
 			"self-authorize":     s.handleSelfAuthorize,
 			"update-client-info": s.handleUpdateClientInfo, // Allow unauthenticated clients to advertise capabilities
+			"status-query":       s.handleStatusQuery,      // Allow clients to query their status
 		},
 		StateConnected: {
 			"connect":            s.handleConnect, // Also allowed when already connected (reconnection)
@@ -273,6 +274,7 @@ func (s *Server) buildSystemHandlers() map[ConnState]map[string]serverHandler {
 			"update-client-info": s.handleUpdateClientInfo,
 			"register-devices":   s.handleRegisterDevices,
 			"self-authorize":     s.handleSelfAuthorize, // Allow authenticated clients to get temp auth.
+			"status-query":       s.handleStatusQuery,   // Allow clients to query their status
 
 			AdminPrefix + "client/list":            s.handleListClients,
 			AdminPrefix + "client/auth":            s.handleAuthorizeClient,
@@ -539,7 +541,7 @@ func (s *Server) forwardRequest(ctx context.Context, origin *clientConn, msg *Me
 
 	targetID := MessageID(s.nextID.Add(1))
 
-	now := time.Now()
+	now := timeNow()
 	s.routeMu.Lock()
 	s.routes[routeKey{targetConn.connFP, targetID}] = &pendingRoute{
 		originFP:     origin.connFP,
@@ -614,7 +616,7 @@ func (s *Server) handleAck(ctx context.Context, conn *clientConn, msg *Message) 
 	route, ok := s.routes[key]
 	if ok {
 		// Extend the deadline.
-		route.deadline = time.Now().Add(s.requestTimeout)
+		route.deadline = timeNow().Add(s.requestTimeout)
 	}
 	s.routeMu.Unlock()
 
@@ -692,7 +694,7 @@ func (s *Server) checkRouteTimeouts(ctx context.Context) {
 }
 
 func (s *Server) expireRoutes(ctx context.Context) error {
-	now := time.Now()
+	now := timeNow()
 	var expired []struct {
 		key   routeKey
 		route *pendingRoute
@@ -1017,7 +1019,7 @@ func (s *Server) handleRevokeClient(ctx context.Context, conn *clientConn, msg *
 		expiresAt = rec.ExpiresAt
 	} else {
 		// If no record, use a default expiry.
-		expiresAt = time.Now().Add(24 * time.Hour)
+		expiresAt = timeNow().Add(24 * time.Hour)
 	}
 
 	// Revoke the client.
@@ -1142,4 +1144,14 @@ func (s *Server) handleTriggerRenewal(ctx context.Context, conn *clientConn, msg
 
 	notification := TriggerRenewalNotification{}
 	return s.sendSystemNotification(ctx, targetConn, "trigger-renewal", notification)
+}
+
+func (s *Server) handleStatusQuery(ctx context.Context, conn *clientConn, msg *Message, w io.Writer, ack Ack) error {
+	status, err := s.clients.GetClientStatus(conn.connFP)
+	if err != nil {
+		return err
+	}
+
+	resp := StatusQueryResponse{Status: status}
+	return cbor.NewEncoder(w).Encode(resp)
 }

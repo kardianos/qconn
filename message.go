@@ -115,6 +115,21 @@ func (ta TA) IsZero() bool {
 	return ta == TA{}
 }
 
+// MarshalText implements encoding.TextMarshaler for JSON encoding.
+func (ta TA) MarshalText() ([]byte, error) {
+	return []byte(ta.String()), nil
+}
+
+// UnmarshalText implements encoding.TextUnmarshaler for JSON decoding.
+func (ta *TA) UnmarshalText(text []byte) error {
+	parsed, err := ParseTA(string(text))
+	if err != nil {
+		return err
+	}
+	*ta = parsed
+	return nil
+}
+
 func ParseTA(s string) (TA, error) {
 	prefix, body, err := bech32.Decode(s)
 	if err != nil {
@@ -163,6 +178,21 @@ func (f *FP) UnmarshalBinary(data []byte) error {
 		return FingerprintSizeError{Got: len(data)}
 	}
 	copy(f[:], data)
+	return nil
+}
+
+// MarshalText implements encoding.TextMarshaler for JSON encoding.
+func (f FP) MarshalText() ([]byte, error) {
+	return []byte(f.String()), nil
+}
+
+// UnmarshalText implements encoding.TextUnmarshaler for JSON decoding.
+func (f *FP) UnmarshalText(text []byte) error {
+	parsed, err := ParseFP(string(text))
+	if err != nil {
+		return err
+	}
+	*f = parsed
 	return nil
 }
 
@@ -377,6 +407,17 @@ func (TriggerRenewalRequest) Type() string { return AdminPrefix + "client/trigge
 
 // TriggerRenewalNotification is sent from server to client to trigger certificate renewal.
 type TriggerRenewalNotification struct{}
+
+// StatusQueryRequest is sent by clients to query their current status on the server.
+// This is useful for state reconciliation after reconnection.
+type StatusQueryRequest struct{}
+
+func (StatusQueryRequest) Type() string { return "status-query" }
+
+// StatusQueryResponse contains the client's current status from the server's perspective.
+type StatusQueryResponse struct {
+	Status ClientStatus `cbor:"status"`
+}
 
 // Common errors.
 var (

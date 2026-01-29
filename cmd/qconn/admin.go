@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -68,12 +69,14 @@ func runAdminAuth(ctx context.Context, args []string) error {
 		authToken      string
 		configPath     string
 		hostname       string
+		jsonOut        bool
 	)
-	fs.StringVar(&server, "server", "", "Server address (required)")
-	fs.StringVar(&provisionToken, "provision-token", "", "Provision token (required for first auth)")
-	fs.StringVar(&authToken, "auth-token", "", "Auth token for self-authorization (required)")
-	fs.StringVar(&configPath, "config", defaultConfigPath, "Config file path")
+	fs.StringVar(&server, "server", envDefault(EnvServer, ""), "Server address (required) (env: "+EnvServer+")")
+	fs.StringVar(&provisionToken, "provision-token", envDefault(EnvProvisionToken, ""), "Provision token (required for first auth) (env: "+EnvProvisionToken+")")
+	fs.StringVar(&authToken, "auth-token", envDefault(EnvAuthToken, ""), "Auth token for self-authorization (required) (env: "+EnvAuthToken+")")
+	fs.StringVar(&configPath, "config", envDefault(EnvConfig, defaultConfigPath), "Config file path (env: "+EnvConfig+")")
 	fs.StringVar(&hostname, "hostname", "admin", "Hostname for this admin client")
+	fs.BoolVar(&jsonOut, "json", false, "Output in JSON format")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -102,9 +105,13 @@ func runAdminAuth(ctx context.Context, args []string) error {
 	for resp := range responses {
 		switch r := resp.(type) {
 		case *qexec.RespAdminAuthed:
-			fmt.Printf("Authenticated and approved as admin\n")
-			fmt.Printf("Fingerprint: %s\n", r.Fingerprint)
-			fmt.Printf("Config saved to: %s\n", r.ConfigPath)
+			if jsonOut {
+				_ = json.NewEncoder(os.Stdout).Encode(r)
+			} else {
+				fmt.Printf("Authenticated and approved as admin\n")
+				fmt.Printf("Fingerprint: %s\n", r.Fingerprint)
+				fmt.Printf("Config saved to: %s\n", r.ConfigPath)
+			}
 		}
 	}
 
@@ -113,8 +120,12 @@ func runAdminAuth(ctx context.Context, args []string) error {
 
 func runAdminList(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("admin list", flag.ExitOnError)
-	var configPath string
-	fs.StringVar(&configPath, "config", defaultConfigPath, "Config file path")
+	var (
+		configPath string
+		jsonOut    bool
+	)
+	fs.StringVar(&configPath, "config", envDefault(EnvConfig, defaultConfigPath), "Config file path (env: "+EnvConfig+")")
+	fs.BoolVar(&jsonOut, "json", false, "Output in JSON format")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -132,13 +143,17 @@ func runAdminList(ctx context.Context, args []string) error {
 	for resp := range responses {
 		switch r := resp.(type) {
 		case *qexec.RespClientList:
-			for _, c := range r.Clients {
-				status := c.Status.String()
-				online := "offline"
-				if c.Online {
-					online = "online"
+			if jsonOut {
+				_ = json.NewEncoder(os.Stdout).Encode(r.Clients)
+			} else {
+				for _, c := range r.Clients {
+					status := c.Status.String()
+					online := "offline"
+					if c.Online {
+						online = "online"
+					}
+					fmt.Printf("%s  %s  %s  %s  roles=%v req-roles=%v devs=%v\n", c.Fingerprint, c.Hostname, status, online, c.Roles, c.RequestedRoles, c.Devices)
 				}
-				fmt.Printf("%s  %s  %s  %s  roles=%v req-roles=%v devs=%v\n", c.Fingerprint, c.Hostname, status, online, c.Roles, c.RequestedRoles, c.Devices)
 			}
 		}
 	}
@@ -153,11 +168,13 @@ func runAdminApprove(ctx context.Context, args []string) error {
 		targetFP    string
 		rolesCSV    string
 		useReqRoles bool
+		jsonOut     bool
 	)
-	fs.StringVar(&configPath, "config", defaultConfigPath, "Config file path")
+	fs.StringVar(&configPath, "config", envDefault(EnvConfig, defaultConfigPath), "Config file path (env: "+EnvConfig+")")
 	fs.StringVar(&targetFP, "fp", "", "Target fingerprint (required)")
 	fs.StringVar(&rolesCSV, "roles", "", "comma separated list of roles to assign")
 	fs.BoolVar(&useReqRoles, "req-roles", false, "Use client's requested roles instead of -roles")
+	fs.BoolVar(&jsonOut, "json", false, "Output in JSON format")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -182,7 +199,9 @@ func runAdminApprove(ctx context.Context, args []string) error {
 			return fmt.Errorf("client %s has no requested roles", fp)
 		}
 		roles = reqRoles
-		fmt.Printf("Using requested roles: %v\n", roles)
+		if !jsonOut {
+			fmt.Printf("Using requested roles: %v\n", roles)
+		}
 	} else {
 		roles = parseCSVStringSlice(rolesCSV)
 	}
@@ -202,7 +221,11 @@ func runAdminApprove(ctx context.Context, args []string) error {
 	for resp := range responses {
 		switch r := resp.(type) {
 		case *qexec.RespApproved:
-			fmt.Printf("Approved client %s\n", r.Fingerprint)
+			if jsonOut {
+				_ = json.NewEncoder(os.Stdout).Encode(r)
+			} else {
+				fmt.Printf("Approved client %s\n", r.Fingerprint)
+			}
 		}
 	}
 
@@ -246,9 +269,11 @@ func runAdminRevoke(ctx context.Context, args []string) error {
 	var (
 		configPath string
 		targetFP   string
+		jsonOut    bool
 	)
-	fs.StringVar(&configPath, "config", defaultConfigPath, "Config file path")
+	fs.StringVar(&configPath, "config", envDefault(EnvConfig, defaultConfigPath), "Config file path (env: "+EnvConfig+")")
 	fs.StringVar(&targetFP, "fp", "", "Target fingerprint (required)")
+	fs.BoolVar(&jsonOut, "json", false, "Output in JSON format")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -276,7 +301,11 @@ func runAdminRevoke(ctx context.Context, args []string) error {
 	for resp := range responses {
 		switch r := resp.(type) {
 		case *qexec.RespRevoked:
-			fmt.Printf("Revoked client %s\n", r.Fingerprint)
+			if jsonOut {
+				_ = json.NewEncoder(os.Stdout).Encode(r)
+			} else {
+				fmt.Printf("Revoked client %s\n", r.Fingerprint)
+			}
 		}
 	}
 
@@ -297,10 +326,12 @@ func runAdminRotateToken(ctx context.Context, args []string) error {
 		configPath string
 		targetFP   string
 		token      string
+		jsonOut    bool
 	)
-	fs.StringVar(&configPath, "config", defaultConfigPath, "Config file path")
+	fs.StringVar(&configPath, "config", envDefault(EnvConfig, defaultConfigPath), "Config file path (env: "+EnvConfig+")")
 	fs.StringVar(&targetFP, "fp", "", "Target fingerprint (required)")
 	fs.StringVar(&token, "token", "", "New provision token (required)")
+	fs.BoolVar(&jsonOut, "json", false, "Output in JSON format")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -332,7 +363,11 @@ func runAdminRotateToken(ctx context.Context, args []string) error {
 	for resp := range responses {
 		switch r := resp.(type) {
 		case *qexec.RespTokenRotated:
-			fmt.Printf("Token rotated for client %s\n", r.Fingerprint)
+			if jsonOut {
+				_ = json.NewEncoder(os.Stdout).Encode(r)
+			} else {
+				fmt.Printf("Token rotated for client %s\n", r.Fingerprint)
+			}
 		}
 	}
 
@@ -344,9 +379,11 @@ func runAdminTriggerRenewal(ctx context.Context, args []string) error {
 	var (
 		configPath string
 		targetFP   string
+		jsonOut    bool
 	)
-	fs.StringVar(&configPath, "config", defaultConfigPath, "Config file path")
+	fs.StringVar(&configPath, "config", envDefault(EnvConfig, defaultConfigPath), "Config file path (env: "+EnvConfig+")")
 	fs.StringVar(&targetFP, "fp", "", "Target fingerprint (required)")
+	fs.BoolVar(&jsonOut, "json", false, "Output in JSON format")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -374,7 +411,11 @@ func runAdminTriggerRenewal(ctx context.Context, args []string) error {
 	for resp := range responses {
 		switch r := resp.(type) {
 		case *qexec.RespRenewalTriggered:
-			fmt.Printf("Renewal triggered for client %s\n", r.Fingerprint)
+			if jsonOut {
+				_ = json.NewEncoder(os.Stdout).Encode(r)
+			} else {
+				fmt.Printf("Renewal triggered for client %s\n", r.Fingerprint)
+			}
 		}
 	}
 

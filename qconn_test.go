@@ -933,6 +933,7 @@ func TestBoltAuthManagerDuplicateMachine(t *testing.T) {
 }
 
 func TestSlowHandler(t *testing.T) {
+	resetFakeTime() // Ensure no fake time pollution from previous tests.
 
 	// requestTimeout is 200ms.
 	// To test ack properly, we need a scenario where:
@@ -1326,6 +1327,8 @@ func TestBoltAuthManagerCleanup(t *testing.T) {
 }
 
 func TestUpdateClientInfo(t *testing.T) {
+	resetFakeTime() // Ensure no fake time pollution from previous tests.
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -1433,6 +1436,8 @@ func TestUpdateClientInfo(t *testing.T) {
 }
 
 func TestDeviceTypeRouting(t *testing.T) {
+	resetFakeTime() // Ensure no fake time pollution from previous tests.
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -1841,6 +1846,8 @@ func (r *mockResolver) CallCount() int {
 }
 
 func TestDNSResolverChanges(t *testing.T) {
+	resetFakeTime() // Ensure no fake time pollution from previous tests.
+
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -2018,4 +2025,691 @@ func TestDNSResolverChanges(t *testing.T) {
 		}
 		t.Log("Connected to server 2 after DNS change")
 	})
+}
+
+// TestServerForgetsClientReProvisions tests that when a server "forgets" a client
+// (e.g., server reset, database cleared), the client automatically detects this
+// via StatusUnknown and re-provisions with a new certificate.
+func TestServerForgetsClientReProvisions(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	auth := newMockAuthManager(t)
+	provisionToken := "test-provision-token"
+	auth.SetProvisionTokens([]string{provisionToken})
+
+	// Create and start server.
+	server, err := NewServer(ServerOpt{
+		Auth:    auth,
+		Clients: auth,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	go func() {
+		_ = server.Serve(ctx, conn)
+	}()
+
+	serverAddr := conn.LocalAddr().String()
+
+	// Create client with provision token - will provision automatically.
+	clientCreds := NewMemoryCredentialStore(provisionToken, "forgetful-client")
+	client, err := NewClient(ctx, ClientOpt{
+		ServerAddr: serverAddr,
+		Auth:       clientCreds,
+	})
+	if err != nil {
+		t.Fatalf("initial connection failed: %v", err)
+	}
+
+	// Verify client provisioned successfully.
+	if clientCreds.NeedsProvisioning() {
+		t.Fatal("client should not need provisioning after initial connection")
+	}
+
+	// Get the original fingerprint.
+	originalFP := clientCreds.Fingerprint()
+	t.Logf("Original fingerprint: %s", originalFP)
+
+	// Verify client can make requests.
+	if err := client.Request(ctx, System(), "", &ClientInfoUpdate{MachineIP: "10.0.0.1"}, nil); err != nil {
+		t.Fatalf("initial request failed: %v", err)
+	}
+
+	// Close client connection.
+	if err := client.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	// Simulate server "forgetting" the client by deleting from auth manager.
+	auth.mu.Lock()
+	delete(auth.clients, originalFP)
+	t.Logf("Deleted client record for FP: %s (simulating server forget)", originalFP)
+	auth.mu.Unlock()
+
+	// Wait for server to clean up.
+	time.Sleep(100 * time.Millisecond)
+
+	// Reconnect with the SAME credential store (still has old credentials).
+	// The client should detect StatusUnknown from queryStatus and auto-re-provision.
+	client2, err := NewClient(ctx, ClientOpt{
+		ServerAddr: serverAddr,
+		Auth:       clientCreds,
+	})
+	if err != nil {
+		t.Fatalf("reconnect failed: %v", err)
+	}
+	defer func() { _ = client2.Close() }()
+
+	// Verify client re-provisioned with a NEW fingerprint.
+	newFP := clientCreds.Fingerprint()
+	t.Logf("New fingerprint after re-provision: %s", newFP)
+
+	if newFP == originalFP {
+		t.Errorf("expected new fingerprint after re-provisioning, got same: %s", newFP)
+	}
+
+	// Verify client can make requests with new credentials.
+	if err := client2.Request(ctx, System(), "", &ClientInfoUpdate{MachineIP: "10.0.0.2"}, nil); err != nil {
+		t.Fatalf("request after re-provision failed: %v", err)
+	}
+
+	t.Log("Client successfully auto-re-provisioned after server forgot it")
+}
+
+// TestServerRevokesClientReProvisions tests that when a server revokes a client,
+// the client automatically detects this via StatusRevoked and re-provisions
+// with a new certificate using the same provision token.
+func TestServerRevokesClientReProvisions(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	auth := newMockAuthManager(t)
+	provisionToken := "test-provision-token"
+	auth.SetProvisionTokens([]string{provisionToken})
+
+	// Create and start server.
+	server, err := NewServer(ServerOpt{
+		Auth:    auth,
+		Clients: auth,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	go func() {
+		_ = server.Serve(ctx, conn)
+	}()
+
+	serverAddr := conn.LocalAddr().String()
+
+	// Create client with provision token - will provision automatically.
+	clientCreds := NewMemoryCredentialStore(provisionToken, "revokable-client")
+	client, err := NewClient(ctx, ClientOpt{
+		ServerAddr: serverAddr,
+		Auth:       clientCreds,
+	})
+	if err != nil {
+		t.Fatalf("initial connection failed: %v", err)
+	}
+
+	// Verify client provisioned successfully.
+	if clientCreds.NeedsProvisioning() {
+		t.Fatal("client should not need provisioning after initial connection")
+	}
+
+	// Get the original fingerprint.
+	originalFP := clientCreds.Fingerprint()
+	t.Logf("Original fingerprint: %s", originalFP)
+
+	// Verify client can make requests.
+	if err := client.Request(ctx, System(), "", &ClientInfoUpdate{MachineIP: "10.0.0.1"}, nil); err != nil {
+		t.Fatalf("initial request failed: %v", err)
+	}
+
+	// Close client connection.
+	if err := client.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	// Revoke the client.
+	auth.mu.Lock()
+	if rec, ok := auth.clients[originalFP]; ok {
+		rec.status = StatusRevoked
+		t.Logf("Revoked client with FP: %s", originalFP)
+	} else {
+		auth.mu.Unlock()
+		t.Fatal("client record not found for revocation")
+	}
+	auth.mu.Unlock()
+
+	// Wait for server to clean up.
+	time.Sleep(100 * time.Millisecond)
+
+	// Reconnect with the SAME credential store (still has old credentials).
+	// The client should detect the server rejection (certificate revoked) and auto-re-provision.
+	client2, err := NewClient(ctx, ClientOpt{
+		ServerAddr: serverAddr,
+		Auth:       clientCreds,
+	})
+	if err != nil {
+		t.Fatalf("reconnect failed: %v", err)
+	}
+	defer func() { _ = client2.Close() }()
+
+	// Verify client re-provisioned with a NEW fingerprint.
+	newFP := clientCreds.Fingerprint()
+	t.Logf("New fingerprint after re-provision: %s", newFP)
+
+	if newFP == originalFP {
+		t.Errorf("expected new fingerprint after re-provisioning, got same: %s", newFP)
+	}
+
+	// Verify client can make requests with new credentials.
+	if err := client2.Request(ctx, System(), "", &ClientInfoUpdate{MachineIP: "10.0.0.2"}, nil); err != nil {
+		t.Fatalf("request after re-provision failed: %v", err)
+	}
+
+	t.Log("Client successfully auto-re-provisioned after being revoked")
+}
+
+// TestServerRestartLongRunningClient tests that a long-running client
+// properly detects when the server restarts and reconnects.
+// This is the actual failure scenario: time-provider stays "running" but
+// the server shows it as offline after restart.
+func TestServerRestartLongRunningClient(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	auth := newMockAuthManager(t)
+	provisionToken := "test-provision-token"
+	auth.SetProvisionTokens([]string{provisionToken})
+
+	// Create server.
+	server, err := NewServer(ServerOpt{
+		Auth:    auth,
+		Clients: auth,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverAddr := conn.LocalAddr().String()
+	t.Logf("Server address: %s", serverAddr)
+
+	serverCtx, serverCancel := context.WithCancel(ctx)
+	serverDone := make(chan struct{})
+	go func() {
+		_ = server.Serve(serverCtx, conn)
+		close(serverDone)
+	}()
+
+	// Create a long-running "provider" client that stays connected with auto-reconnect.
+	providerCreds := NewMemoryCredentialStore(provisionToken, "long-running-provider")
+
+	// Track reconnection.
+	reconnected := make(chan struct{}, 1)
+
+	provider, err := NewClient(ctx, ClientOpt{
+		ServerAddr:     serverAddr,
+		Auth:           providerCreds,
+		MaxIdleTimeout: 1 * time.Second, // Short idle timeout to detect server death quickly
+		OnReconnect: func(ctx context.Context, c *Client) error {
+			// Re-register devices after reconnection.
+			err := c.Request(ctx, System(), "", &ClientInfoUpdate{
+				MachineIP: "10.0.0.1",
+				Devices:   []DeviceInfo{{Name: "test-service", Type: "provider"}},
+			}, nil)
+			if err != nil {
+				return err
+			}
+			select {
+			case reconnected <- struct{}{}:
+			default:
+			}
+			return nil
+		},
+		Handler: func(ctx context.Context, msg *Message, w io.Writer, ack Ack) error {
+			// Echo handler
+			_, err := w.Write(msg.Payload)
+			return err
+		},
+	})
+	if err != nil {
+		t.Fatalf("provider connection failed: %v", err)
+	}
+
+	providerFP := providerCreds.Fingerprint()
+	t.Logf("Provider fingerprint: %s", providerFP)
+
+	// Register provider's devices.
+	err = provider.Request(ctx, System(), "", &ClientInfoUpdate{
+		MachineIP: "10.0.0.1",
+		Devices:   []DeviceInfo{{Name: "test-service", Type: "provider"}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("provider update info failed: %v", err)
+	}
+
+	// Approve the provider so it's authenticated.
+	err = auth.SetClientStatus(providerFP, StatusAuthenticated, time.Now().Add(time.Hour), nil)
+	if err != nil {
+		t.Fatalf("approve provider failed: %v", err)
+	}
+
+	// Wait for provider to be in connected state.
+	if err := provider.WaitForConnected(ctx); err != nil {
+		t.Fatalf("provider wait for connected: %v", err)
+	}
+	t.Log("Provider is connected and authenticated")
+
+	// Verify provider is listed and online.
+	var clients []*ClientRecord
+	err = provider.Request(ctx, System(), "", &AdminClientListRequest{}, &clients)
+	if err != nil {
+		t.Fatalf("list clients failed: %v", err)
+	}
+	var providerOnline bool
+	for _, c := range clients {
+		if c.Fingerprint == providerFP {
+			t.Logf("Provider status before restart: %s, online: %v", c.Status, c.Online)
+			providerOnline = c.Online
+		}
+	}
+	if !providerOnline {
+		t.Fatal("provider should be online before server restart")
+	}
+
+	// Stop the server (simulate restart).
+	t.Log("Stopping server...")
+	serverCancel()
+	_ = conn.Close()
+	<-serverDone
+	t.Log("Server stopped")
+
+	// The provider client is still "running" - it hasn't errored yet.
+	// In the real scenario, provider.Close() is NOT called.
+
+	// Give the client time to potentially detect the disconnection.
+	time.Sleep(100 * time.Millisecond)
+
+	// Restart server on the same address.
+	conn2, err := net.ListenPacket("udp", serverAddr)
+	if err != nil {
+		t.Fatalf("failed to restart server: %v", err)
+	}
+	defer func() { _ = conn2.Close() }()
+
+	server2, err := NewServer(ServerOpt{
+		Auth:    auth,
+		Clients: auth,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serverCtx2, serverCancel2 := context.WithCancel(ctx)
+	defer serverCancel2()
+	go func() {
+		_ = server2.Serve(serverCtx2, conn2)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	t.Log("Server restarted")
+
+	// Create a new "consumer" client to check status.
+	consumerCreds := NewMemoryCredentialStore(provisionToken, "consumer")
+	consumer, err := NewClient(ctx, ClientOpt{
+		ServerAddr: serverAddr,
+		Auth:       consumerCreds,
+	})
+	if err != nil {
+		t.Fatalf("consumer connection failed: %v", err)
+	}
+	defer func() { _ = consumer.Close() }()
+
+	consumerFP := consumerCreds.Fingerprint()
+	err = auth.SetClientStatus(consumerFP, StatusAuthenticated, time.Now().Add(time.Hour), nil)
+	if err != nil {
+		t.Fatalf("approve consumer failed: %v", err)
+	}
+
+	// List clients from consumer's perspective.
+	err = consumer.Request(ctx, System(), "", &AdminClientListRequest{}, &clients)
+	if err != nil {
+		t.Fatalf("consumer list clients failed: %v", err)
+	}
+
+	// Check if provider shows as online (it likely won't be yet - reconnecting).
+	var providerFoundOnline bool
+	for _, c := range clients {
+		t.Logf("Client after restart: %s (%s) online=%v status=%s",
+			c.Hostname, c.Fingerprint, c.Online, c.Status)
+		if c.Fingerprint == providerFP && c.Online {
+			providerFoundOnline = true
+		}
+	}
+	t.Logf("Provider online immediately after restart: %v (expected: false)", providerFoundOnline)
+
+	// Initially, the provider may not be online yet (reconnecting).
+	// Wait for it to reconnect.
+	t.Log("Waiting for provider to reconnect...")
+	select {
+	case <-reconnected:
+		t.Log("Provider reconnected successfully!")
+	case <-time.After(5 * time.Second):
+		t.Log("Timeout waiting for provider to reconnect")
+	}
+
+	// Give a moment for server to process the reconnection.
+	time.Sleep(200 * time.Millisecond)
+
+	// List clients again to verify provider is online.
+	err = consumer.Request(ctx, System(), "", &AdminClientListRequest{}, &clients)
+	if err != nil {
+		t.Fatalf("consumer list clients (second attempt) failed: %v", err)
+	}
+
+	providerFoundOnline = false
+	for _, c := range clients {
+		t.Logf("Client after reconnect: %s (%s) online=%v status=%s",
+			c.Hostname, c.Fingerprint, c.Online, c.Status)
+		if c.Fingerprint == providerFP && c.Online {
+			providerFoundOnline = true
+		}
+	}
+
+	if !providerFoundOnline {
+		t.Error("Provider should be online after auto-reconnect")
+	}
+
+	// Try to send a message to the provider by device type.
+	reqPayload := echoRequest{Message: "hello"}
+	var respPayload echoRequest
+	err = consumer.Request(ctx, ToType("provider"), "", &reqPayload, &respPayload)
+	if err != nil {
+		t.Errorf("Request to provider failed after reconnect: %v", err)
+	} else {
+		t.Log("Request to provider succeeded - auto-reconnect working!")
+		if respPayload.Message != reqPayload.Message {
+			t.Errorf("Expected message %q, got %q", reqPayload.Message, respPayload.Message)
+		}
+	}
+
+	// Clean up the original provider.
+	_ = provider.Close()
+}
+
+// TestServerRestartClientReconnects tests that when a server is restarted,
+// clients can successfully reconnect and become operational again.
+func TestServerRestartClientReconnects(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	auth := newMockAuthManager(t)
+	provisionToken := "test-provision-token"
+	auth.SetProvisionTokens([]string{provisionToken})
+
+	// Create server.
+	server, err := NewServer(ServerOpt{
+		Auth:    auth,
+		Clients: auth,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Start server on a specific port so we can restart on the same address.
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverAddr := conn.LocalAddr().String()
+	t.Logf("Server address: %s", serverAddr)
+
+	serverCtx, serverCancel := context.WithCancel(ctx)
+	serverDone := make(chan struct{})
+	go func() {
+		_ = server.Serve(serverCtx, conn)
+		close(serverDone)
+	}()
+
+	// Create client with provision token - will provision automatically.
+	clientCreds := NewMemoryCredentialStore(provisionToken, "restart-test-client")
+	client, err := NewClient(ctx, ClientOpt{
+		ServerAddr: serverAddr,
+		Auth:       clientCreds,
+	})
+	if err != nil {
+		t.Fatalf("initial connection failed: %v", err)
+	}
+
+	// Verify client provisioned.
+	if clientCreds.NeedsProvisioning() {
+		t.Fatal("client should not need provisioning after initial connection")
+	}
+	originalFP := clientCreds.Fingerprint()
+	t.Logf("Client fingerprint: %s", originalFP)
+
+	// Verify client can make requests.
+	if err := client.Request(ctx, System(), "", &ClientInfoUpdate{MachineIP: "10.0.0.1"}, nil); err != nil {
+		t.Fatalf("initial request failed: %v", err)
+	}
+	t.Log("Initial request successful")
+
+	// Stop the server.
+	serverCancel()
+	_ = conn.Close()
+	<-serverDone
+	t.Log("Server stopped")
+
+	// Verify client request fails after server stops.
+	shortCtx, shortCancel := context.WithTimeout(ctx, 1*time.Second)
+	err = client.Request(shortCtx, System(), "", &ClientInfoUpdate{MachineIP: "10.0.0.2"}, nil)
+	shortCancel()
+	if err == nil {
+		t.Fatal("expected request to fail after server stopped, but it succeeded")
+	}
+	t.Logf("Request failed after server stop (expected): %v", err)
+	_ = client.Close()
+
+	// Restart the server on the same address.
+	conn2, err := net.ListenPacket("udp", serverAddr)
+	if err != nil {
+		t.Fatalf("failed to restart server on same address: %v", err)
+	}
+	defer func() { _ = conn2.Close() }()
+
+	server2, err := NewServer(ServerOpt{
+		Auth:    auth,
+		Clients: auth,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serverCtx2, serverCancel2 := context.WithCancel(ctx)
+	defer serverCancel2()
+	go func() {
+		_ = server2.Serve(serverCtx2, conn2)
+	}()
+
+	// Wait a bit for server to be ready.
+	time.Sleep(50 * time.Millisecond)
+	t.Log("Server restarted")
+
+	// Create new client with the SAME credentials.
+	// Since the client already has valid credentials (from provisioning),
+	// and the server still recognizes them (same auth manager), it should reconnect.
+	client2, err := NewClient(ctx, ClientOpt{
+		ServerAddr: serverAddr,
+		Auth:       clientCreds,
+	})
+	if err != nil {
+		t.Fatalf("reconnect after server restart failed: %v", err)
+	}
+	defer func() { _ = client2.Close() }()
+
+	// Verify the fingerprint is the same (no re-provisioning needed).
+	if clientCreds.Fingerprint() != originalFP {
+		t.Errorf("expected same fingerprint after reconnect, got different: %s vs %s",
+			clientCreds.Fingerprint(), originalFP)
+	}
+
+	// Verify client can make requests on the restarted server.
+	if err := client2.Request(ctx, System(), "", &ClientInfoUpdate{MachineIP: "10.0.0.3"}, nil); err != nil {
+		t.Fatalf("request after server restart failed: %v", err)
+	}
+	t.Log("Client successfully reconnected after server restart")
+}
+
+// TestServerRestartWithBoltAuth tests server restart with BoltAuthManager,
+// which persists client data across restarts.
+func TestServerRestartWithBoltAuth(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Create temp directory for bbolt database.
+	tempDir, err := os.MkdirTemp("", "qconn-restart-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	provisionToken := "test-provision-token"
+	dbPath := filepath.Join(tempDir, "auth.db")
+
+	// Create BoltAuthManager.
+	auth, _, err := NewBoltAuthManager(BoltAuthConfig{
+		DBPath:          dbPath,
+		ServerHostname:  "localhost",
+		ProvisionTokens: []string{provisionToken},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create and start server.
+	server, err := NewServer(ServerOpt{
+		Auth:    auth,
+		Clients: auth,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverAddr := conn.LocalAddr().String()
+	t.Logf("Server address: %s", serverAddr)
+
+	serverCtx, serverCancel := context.WithCancel(ctx)
+	serverDone := make(chan struct{})
+	go func() {
+		_ = server.Serve(serverCtx, conn)
+		close(serverDone)
+	}()
+
+	// Create client with provision token.
+	clientCreds := NewMemoryCredentialStore(provisionToken, "bolt-restart-client")
+	client, err := NewClient(ctx, ClientOpt{
+		ServerAddr: serverAddr,
+		Auth:       clientCreds,
+	})
+	if err != nil {
+		t.Fatalf("initial connection failed: %v", err)
+	}
+
+	originalFP := clientCreds.Fingerprint()
+	t.Logf("Client fingerprint: %s", originalFP)
+
+	// Verify client can make requests.
+	if err := client.Request(ctx, System(), "", &ClientInfoUpdate{MachineIP: "10.0.0.1"}, nil); err != nil {
+		t.Fatalf("initial request failed: %v", err)
+	}
+	t.Log("Initial request successful")
+	_ = client.Close()
+
+	// Stop server and close auth manager (simulating full restart).
+	serverCancel()
+	_ = conn.Close()
+	<-serverDone
+	auth.Close()
+	t.Log("Server stopped and database closed")
+
+	// Restart with a NEW BoltAuthManager pointing to the SAME database.
+	// This simulates a full server restart where client data should persist.
+	auth2, _, err := NewBoltAuthManager(BoltAuthConfig{
+		DBPath:          dbPath,
+		ServerHostname:  "localhost",
+		ProvisionTokens: []string{provisionToken},
+	})
+	if err != nil {
+		t.Fatalf("failed to reopen auth manager: %v", err)
+	}
+	defer auth2.Close()
+
+	server2, err := NewServer(ServerOpt{
+		Auth:    auth2,
+		Clients: auth2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn2, err := net.ListenPacket("udp", serverAddr)
+	if err != nil {
+		t.Fatalf("failed to restart server on same address: %v", err)
+	}
+	defer func() { _ = conn2.Close() }()
+
+	serverCtx2, serverCancel2 := context.WithCancel(ctx)
+	defer serverCancel2()
+	go func() {
+		_ = server2.Serve(serverCtx2, conn2)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	t.Log("Server restarted with new BoltAuthManager")
+
+	// Reconnect with same credentials.
+	client2, err := NewClient(ctx, ClientOpt{
+		ServerAddr: serverAddr,
+		Auth:       clientCreds,
+	})
+	if err != nil {
+		t.Fatalf("reconnect after server restart failed: %v", err)
+	}
+	defer func() { _ = client2.Close() }()
+
+	// Verify same fingerprint (client data persisted in database).
+	if clientCreds.Fingerprint() != originalFP {
+		t.Errorf("expected same fingerprint after restart, got different: %s vs %s",
+			clientCreds.Fingerprint(), originalFP)
+	}
+
+	// Verify client can make requests.
+	if err := client2.Request(ctx, System(), "", &ClientInfoUpdate{MachineIP: "10.0.0.2"}, nil); err != nil {
+		t.Fatalf("request after server restart failed: %v", err)
+	}
+	t.Log("Client successfully reconnected after server restart with BoltAuth persistence")
 }

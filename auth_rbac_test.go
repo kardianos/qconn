@@ -735,13 +735,6 @@ func TestRenewalWithFakeTime(t *testing.T) {
 // TestExpiredCertificateReProvisions verifies that a client with an expired certificate
 // automatically falls back to provisioning mode and can re-provision.
 func TestExpiredCertificateReProvisions(t *testing.T) {
-	// Skip: This test has a known issue where QUIC's internal state doesn't
-	// properly handle connections after the fake time is advanced significantly.
-	// The client's second reconnection (after re-provisioning) is never seen by
-	// the server's listener.Accept. This may be an interaction between the fake
-	// time mechanism and QUIC's connection management.
-	t.Skip("known issue with fake time and QUIC reconnection")
-
 	// Set up fake time and restore after test.
 	fakeNow := time.Now()
 	cleanup := setFakeTime(&fakeNow)

@@ -37,6 +37,10 @@ type CredentialStore interface {
 	// Returns zero FP if no credentials exist.
 	Fingerprint() FP
 
+	// ClearCredentials removes stored certificate and key, forcing re-provisioning.
+	// The provision token is preserved.
+	ClearCredentials() error
+
 	// Close releases any resources held by the store.
 	Close() error
 }

@@ -59,12 +59,12 @@ func NewClientCredential(cfg ClientCredentialConfig) (*ClientCredential, error) 
 
 	// Load or set the provision token.
 	if cfg.ProvisionToken != "" {
-		// Token provided in config - save it to store.
+		// Token provided in config - save it to store (encrypted).
 		s.token = cfg.ProvisionToken
-		_ = cfg.Store.Set(KeyToken, false, []byte(cfg.ProvisionToken))
+		_ = cfg.Store.Set(KeyToken, true, []byte(cfg.ProvisionToken))
 	} else {
-		// Try to load token from store.
-		if data, err := cfg.Store.Get(KeyToken, false); err == nil && len(data) > 0 {
+		// Try to load token from store (decrypted).
+		if data, err := cfg.Store.Get(KeyToken, true); err == nil && len(data) > 0 {
 			s.token = string(data)
 		}
 	}
@@ -154,7 +154,7 @@ func (s *ClientCredential) SetProvisionToken(token string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.token = token
-	return s.store.Set(KeyToken, false, []byte(token))
+	return s.store.Set(KeyToken, true, []byte(token))
 }
 
 // Hostname returns the client's hostname for provisioning.
@@ -262,6 +262,24 @@ func (s *ClientCredential) OnUpdate() <-chan struct{} {
 		s.sig = make(chan struct{})
 	}
 	return s.sig
+}
+
+// ClearCredentials removes stored certificate and key, forcing re-provisioning.
+// The provision token is preserved.
+func (s *ClientCredential) ClearCredentials() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Clear in-memory state.
+	s.fingerprint = FP{}
+	s.expiresAt = time.Time{}
+
+	// Clear from store by setting empty values (ignore errors).
+	_ = s.store.Set(KeyCert, false, nil)
+	_ = s.store.Set(KeyKey, false, nil)
+	_ = s.store.Set(KeyCA, false, nil)
+
+	return nil
 }
 
 // Close releases any resources held by the store.

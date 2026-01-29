@@ -643,7 +643,7 @@ func (m *BoltAuthManager) SignProvisioningCSR(csrPEM []byte, hostname string) ([
 
 	// Store client record as unauthenticated - provisioning only grants the certificate.
 	// The client must be authorized by an admin before it can communicate.
-	now := time.Now()
+	now := timeNow()
 	fp := FingerprintOf(leaf)
 	rec := ClientRecord{
 		Fingerprint: fp,
@@ -742,7 +742,7 @@ func (m *BoltAuthManager) SetClientStatus(fp FP, status ClientStatus, expiresAt 
 		return fmt.Errorf("cannot set status to unknown")
 	}
 
-	now := time.Now()
+	now := timeNow()
 	return m.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketClients)
 		data := b.Get(fp[:])
@@ -810,7 +810,7 @@ func (m *BoltAuthManager) GetClientRecord(fp FP) (*ClientRecord, error) {
 // UpdateClientInfo updates the client info fields (MachineIP, Devices, etc).
 // Only updates the specified fields; does not change status or expiry.
 func (m *BoltAuthManager) UpdateClientInfo(fp FP, info *ClientInfoUpdate) error {
-	now := time.Now()
+	now := timeNow()
 	return m.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketClients)
 		data := b.Get(fp[:])
@@ -851,7 +851,7 @@ func (m *BoltAuthManager) UpdateClientInfo(fp FP, info *ClientInfoUpdate) error 
 
 // SetClientRoles updates a client's assigned roles.
 func (m *BoltAuthManager) SetClientRoles(fp FP, roles []string) error {
-	now := time.Now()
+	now := timeNow()
 	return m.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketClients)
 		data := b.Get(fp[:])

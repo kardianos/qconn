@@ -11,6 +11,22 @@ import (
 	"syscall"
 )
 
+// Environment variable names.
+const (
+	EnvConfig         = "QCONN_CONFIG"
+	EnvServer         = "QCONN_SERVER"
+	EnvProvisionToken = "QCONN_PROVISION_TOKEN"
+	EnvAuthToken      = "QCONN_AUTH_TOKEN"
+)
+
+// envDefault returns the environment variable value if set, otherwise the default.
+func envDefault(envVar, defaultVal string) string {
+	if v := os.Getenv(envVar); v != "" {
+		return v
+	}
+	return defaultVal
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -72,7 +88,7 @@ func runServerMode(ctx context.Context, args []string) error {
 	opts := &ServerOptions{}
 	var genConfig bool
 	fs.StringVar(&opts.ListenAddr, "listen", "127.0.0.1:9443", "Address to listen on")
-	fs.StringVar(&opts.ConfigFile, "config", "config.json", "Path to JSON configuration file")
+	fs.StringVar(&opts.ConfigFile, "config", envDefault(EnvConfig, "config.json"), "Path to JSON configuration file (env: "+EnvConfig+")")
 	fs.BoolVar(&genConfig, "gen-config", false, "Generate a default config file to stdout or config flag if provided and exit")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -107,9 +123,9 @@ func runServerMode(ctx context.Context, args []string) error {
 func runTimeProviderMode(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("time-provider", flag.ExitOnError)
 	opts := &TimeProviderOptions{}
-	fs.StringVar(&opts.ServerAddr, "server", "127.0.0.1:9443", "Server address")
-	fs.StringVar(&opts.ConfigPath, "config", "./time-provider.conf", "Config file path")
-	fs.StringVar(&opts.ProvisionToken, "provision-token", "", "Provision token for initial setup")
+	fs.StringVar(&opts.ServerAddr, "server", envDefault(EnvServer, "127.0.0.1:9443"), "Server address (env: "+EnvServer+")")
+	fs.StringVar(&opts.ConfigPath, "config", envDefault(EnvConfig, "./time-provider.conf"), "Config file path (env: "+EnvConfig+")")
+	fs.StringVar(&opts.ProvisionToken, "provision-token", envDefault(EnvProvisionToken, ""), "Provision token for initial setup (env: "+EnvProvisionToken+")")
 	fs.StringVar(&opts.Hostname, "hostname", "time-provider", "Client hostname")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -124,9 +140,9 @@ func runTimeConsumerMode(ctx context.Context, args []string) error {
 		fs.PrintDefaults()
 	}
 	opts := &TimeConsumerOptions{}
-	fs.StringVar(&opts.ServerAddr, "server", "127.0.0.1:9443", "Server address")
-	fs.StringVar(&opts.ConfigPath, "config", "./time-consumer.conf", "Config file path")
-	fs.StringVar(&opts.ProvisionToken, "provision-token", "", "Provision token for initial setup")
+	fs.StringVar(&opts.ServerAddr, "server", envDefault(EnvServer, "127.0.0.1:9443"), "Server address (env: "+EnvServer+")")
+	fs.StringVar(&opts.ConfigPath, "config", envDefault(EnvConfig, "./time-consumer.conf"), "Config file path (env: "+EnvConfig+")")
+	fs.StringVar(&opts.ProvisionToken, "provision-token", envDefault(EnvProvisionToken, ""), "Provision token for initial setup (env: "+EnvProvisionToken+")")
 	fs.StringVar(&opts.Hostname, "hostname", "time-consumer", "Client hostname")
 	if err := fs.Parse(args); err != nil {
 		return err

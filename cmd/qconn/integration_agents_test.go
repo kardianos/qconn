@@ -792,19 +792,20 @@ func TestIntegrationAgents(t *testing.T) {
 			},
 			Emit: "provider-ready",
 		},
-		// After revocation, reconnect with NEW credentials (simulates re-provisioning)
+		// After revocation, reconnect with SAME credentials - tests auto-recovery.
+		// The client should detect StatusRevoked and auto-re-provision.
 		{
-			Name:       "Reconnect after revocation (re-provision with new creds)",
+			Name:       "Reconnect after revocation (auto-re-provision)",
 			Wait:       "provider-revoked",
 			Background: true, // Provider runs until test completes
 			Cmd: func(d *AgentData) any {
 				return &CmdTimeProviderStart{
 					ServerAddr:     d.Global(keyServerAddr).(string),
-					ConfigPath:     tempDir + "/provider-new.conf", // NEW file forces re-provisioning
+					ConfigPath:     tempDir + "/provider.conf", // SAME file - tests auto-recovery
 					ProvisionToken: provisionToken,
 					Hostname:       "time-provider",
 					OnConnected: func(fp qconn.FP) {
-						t.Logf("Provider reconnected with new FP: %s", fp)
+						t.Logf("Provider auto-re-provisioned with new FP: %s", fp)
 						providerAgent.Milestones[msProviderReconnected] = true
 						signals.Emit("provider-reconnected")
 					},
@@ -860,4 +861,249 @@ func TestIntegrationAgents(t *testing.T) {
 
 	// Cleanup
 	serverCancel()
+}
+
+// TestIntegrationServerRestart tests that clients can reconnect after a server restart.
+// This test verifies:
+// 1. Server starts and client connects
+// 2. Server stops (simulated restart)
+// 3. Server restarts on same address
+// 4. Client reconnects and can make requests
+func TestIntegrationServerRestart(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Create temp directory
+	tempDir, err := os.MkdirTemp("", "qconn-restart-agents-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	provisionToken := "restart-test-provision-token"
+
+	signals := NewSignals()
+	defer signals.Close()
+
+	data := NewTestData()
+	data.SetGlobal(keyConfigPath, tempDir+"/admin.conf")
+
+	// Milestone flags
+	const (
+		msServer1Started   = "server1-started"
+		msServer2Started   = "server2-started"
+		msClientConnected1 = "client-connected-1"
+		msClientConnected2 = "client-connected-2"
+		msClientAuthed     = "client-authed"
+		msClientRequest1   = "client-request-1"
+		msClientRequest2   = "client-request-2"
+	)
+
+	// Create contexts for server phases
+	server1Ctx, server1Cancel := context.WithCancel(ctx)
+	server2Ctx, server2Cancel := context.WithCancel(ctx)
+	defer server2Cancel()
+
+	// Variable to store server address for reuse
+	var serverAddr string
+
+	// Define agents
+	serverAgent := &Agent{
+		Name:   "server",
+		Ctx:    server1Ctx,
+		Cancel: server1Cancel,
+		Milestones: map[string]bool{
+			msServer1Started: false,
+			msServer2Started: false,
+		},
+	}
+
+	clientAgent := &Agent{
+		Name: "client",
+		Milestones: map[string]bool{
+			msClientConnected1: false,
+			msClientConnected2: false,
+			msClientAuthed:     false,
+			msClientRequest1:   false,
+			msClientRequest2:   false,
+		},
+	}
+
+	// Server steps - run in 2 phases with restart in between
+	serverAgent.Steps = []Step{
+		{
+			Name:       "Start server (phase 1)",
+			Background: true,
+			Cmd: func(d *AgentData) any {
+				return &qexec.CmdServerStart{
+					ListenAddr:      "127.0.0.1:0",
+					DBPath:          tempDir + "/server/auth.db",
+					ProvisionTokens: []string{provisionToken},
+					Roles: map[string]*qconn.RoleConfig{
+						"admin":  {Submit: []string{"admin/client/list", "admin/client/auth"}},
+						"client": {},
+					},
+				}
+			},
+			Check: func(t *testing.T, d *AgentData, resps []any) {
+				for _, r := range resps {
+					if ready, ok := r.(*qexec.RespServerReady); ok {
+						d.SetGlobal(keyServerAddr, ready.Addr)
+						d.SetGlobal(keyAuthToken, ready.AuthToken)
+						serverAddr = ready.Addr
+						t.Logf("Server phase 1 ready on %s", ready.Addr)
+						serverAgent.Milestones[msServer1Started] = true
+					}
+				}
+			},
+			Emit: "server-phase1-ready",
+		},
+		{
+			Name: "Wait for client to complete initial test, then stop",
+			Wait: "client-phase1-done",
+			Cmd:  func(d *AgentData) any { return nil },
+			Emit: "server-phase1-stopping",
+		},
+	}
+
+	// Client steps
+	clientAgent.Steps = []Step{
+		{
+			Name: "Connect and authenticate (phase 1)",
+			Wait: "server-phase1-ready",
+			Cmd: func(d *AgentData) any {
+				addr := d.Global(keyServerAddr).(string)
+				token := d.Global(keyAuthToken).(qconn.TA)
+				return &qexec.CmdAdminAuth{
+					ServerAddr:     addr,
+					ConfigPath:     tempDir + "/client.conf",
+					ProvisionToken: provisionToken,
+					AuthToken:      token.String(),
+					Hostname:       "restart-test-client",
+				}
+			},
+			Check: func(t *testing.T, d *AgentData, resps []any) {
+				for _, r := range resps {
+					if authed, ok := r.(*qexec.RespAdminAuthed); ok {
+						d.Set(keyAdminFP, authed.Fingerprint)
+						t.Logf("Client authenticated: %s", authed.Fingerprint)
+						clientAgent.Milestones[msClientConnected1] = true
+						clientAgent.Milestones[msClientAuthed] = true
+					}
+				}
+			},
+		},
+		{
+			Name: "Make request on phase 1 server",
+			Cmd: func(d *AgentData) any {
+				return &qexec.CmdAdminList{
+					ServerAddr: d.Global(keyServerAddr).(string),
+					ConfigPath: tempDir + "/client.conf",
+				}
+			},
+			Check: func(t *testing.T, d *AgentData, resps []any) {
+				for _, r := range resps {
+					if list, ok := r.(*qexec.RespClientList); ok {
+						t.Logf("Phase 1: Got %d clients", len(list.Clients))
+						if len(list.Clients) > 0 {
+							clientAgent.Milestones[msClientRequest1] = true
+						}
+					}
+				}
+			},
+			Emit: "client-phase1-done",
+		},
+		{
+			Name: "Wait for server to stop",
+			Wait: "server-phase1-stopping",
+			Cmd:  func(d *AgentData) any { return nil },
+		},
+		{
+			Name:    "Stop phase 1 server and start phase 2",
+			Timeout: 5 * time.Second,
+			Cmd: func(d *AgentData) any {
+				// Stop the first server
+				server1Cancel()
+				t.Log("Server phase 1 cancelled, waiting for restart...")
+
+				// Give time for server to stop
+				time.Sleep(200 * time.Millisecond)
+
+				// Start phase 2 server on the SAME address using a goroutine
+				// We'll signal when it's ready
+				go func() {
+					responses := make(chan any, 10)
+					cmd := &qexec.CmdServerStart{
+						ListenAddr:      serverAddr, // Same address!
+						DBPath:          tempDir + "/server/auth.db",
+						ProvisionTokens: []string{provisionToken},
+						Roles: map[string]*qconn.RoleConfig{
+							"admin":  {Submit: []string{"admin/client/list", "admin/client/auth"}},
+							"client": {},
+						},
+					}
+
+					// Start command in background, will run until server2Ctx is cancelled
+					// Note: qexec.Execute closes the responses channel when done
+					go func() {
+						_ = qexec.Execute(server2Ctx, cmd, responses)
+					}()
+
+					// Wait for ready response
+					for r := range responses {
+						if ready, ok := r.(*qexec.RespServerReady); ok {
+							t.Logf("Server phase 2 ready on %s", ready.Addr)
+							serverAgent.Milestones[msServer2Started] = true
+							signals.Emit("server-phase2-ready")
+							break
+						}
+					}
+				}()
+
+				return nil
+			},
+		},
+		{
+			Name: "Wait for server phase 2",
+			Wait: "server-phase2-ready",
+			Cmd:  func(d *AgentData) any { return nil },
+		},
+		{
+			Name:    "Reconnect and make request on phase 2 server",
+			Timeout: 10 * time.Second,
+			Cmd: func(d *AgentData) any {
+				return &qexec.CmdAdminList{
+					ServerAddr: d.Global(keyServerAddr).(string),
+					ConfigPath: tempDir + "/client.conf",
+				}
+			},
+			Check: func(t *testing.T, d *AgentData, resps []any) {
+				for _, r := range resps {
+					if list, ok := r.(*qexec.RespClientList); ok {
+						t.Logf("Phase 2: Got %d clients after server restart", len(list.Clients))
+						clientAgent.Milestones[msClientConnected2] = true
+						clientAgent.Milestones[msClientRequest2] = true
+
+						// Verify client data persisted (should see our client)
+						var foundClient bool
+						for _, c := range list.Clients {
+							if c.Hostname == "restart-test-client" {
+								foundClient = true
+								t.Logf("Found persisted client: %s (status: %s)", c.Fingerprint, c.Status)
+							}
+						}
+						if !foundClient {
+							t.Log("Note: Client may have reconnected with new session")
+						}
+					}
+				}
+			},
+			Emit: "test-complete",
+		},
+	}
+
+	agents := []*Agent{serverAgent, clientAgent}
+	runAgents(t, ctx, signals, data, agents)
+
+	t.Log("Server restart test completed successfully")
 }

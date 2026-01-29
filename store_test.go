@@ -162,6 +162,17 @@ func (m *MemoryCredentialStore) Fingerprint() FP {
 	return m.fingerprint
 }
 
+func (m *MemoryCredentialStore) ClearCredentials() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.certPEM = nil
+	m.keyPEM = nil
+	m.rootCAPEM = nil
+	m.fingerprint = FP{}
+	m.expiresAt = time.Time{}
+	return nil
+}
+
 func (m *MemoryCredentialStore) Close() error {
 	return nil
 }

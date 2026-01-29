@@ -36,6 +36,19 @@ func (c *CmdTimeProviderStart) handler() qconn.Handler {
 	}
 }
 
+// registerClientInfo sends the client info update to the server.
+// This is used both on initial connection and after reconnection.
+func (c *CmdTimeProviderStart) registerClientInfo(ctx context.Context, client *qconn.Client) error {
+	updateInfo := qconn.ClientInfoUpdate{
+		Devices: []qconn.DeviceInfo{
+			{Name: "time-service", Type: "time-provider"},
+		},
+		MsgTypes:       []string{"time"},
+		RequestedRoles: []string{"time-provider"},
+	}
+	return client.Request(ctx, qconn.System(), "", &updateInfo, nil)
+}
+
 // ConnectConfig implements qexec.ClientCommand.
 func (c *CmdTimeProviderStart) ConnectConfig() qexec.ConnectConfig {
 	hostname := c.Hostname
@@ -48,6 +61,7 @@ func (c *CmdTimeProviderStart) ConnectConfig() qexec.ConnectConfig {
 		ProvisionToken: c.ProvisionToken,
 		Hostname:       hostname,
 		Handler:        c.handler(),
+		OnReconnect:    c.registerClientInfo,
 	}
 }
 
@@ -60,14 +74,7 @@ func (c *CmdTimeProviderStart) Execute(ctx context.Context, conn *qexec.ConnectR
 
 	// Advertise capabilities and requested roles before waiting for authorization.
 	// This allows admins to see what the client can do and what it's requesting.
-	updateInfo := qconn.ClientInfoUpdate{
-		Devices: []qconn.DeviceInfo{
-			{Name: "time-service", Type: "time-provider"},
-		},
-		MsgTypes:       []string{"time"},
-		RequestedRoles: []string{"time-provider"},
-	}
-	if err := conn.Client.Request(ctx, qconn.System(), "", &updateInfo, nil); err != nil {
+	if err := c.registerClientInfo(ctx, conn.Client); err != nil {
 		return fmt.Errorf("update client info: %w", err)
 	}
 

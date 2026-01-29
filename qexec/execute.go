@@ -3,6 +3,7 @@ package qexec
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/kardianos/qconn"
 	"github.com/kardianos/qconn/qstore"
@@ -48,6 +49,13 @@ type ConnectConfig struct {
 	Hostname       string        // Optional: hostname for provisioning
 	Handler        qconn.Handler // Optional: handler for incoming requests
 	DefaultRole    string        // Optional: default role for requests
+
+	// OnReconnect is called after a successful reconnection to re-register state.
+	OnReconnect func(ctx context.Context, c *qconn.Client) error
+	// MaxIdleTimeout controls how quickly a dead server is detected.
+	// Valid range: 500ms to 600s. Values outside this range are clamped.
+	// Default is 30 seconds if not specified.
+	MaxIdleTimeout time.Duration
 }
 
 // ConnectResult holds the connected client and related resources.
@@ -103,6 +111,8 @@ func ConnectClient(ctx context.Context, cfg ConnectConfig) (*ConnectResult, erro
 		Store:              clientStore,
 		Handler:            cfg.Handler,
 		DefaultRequestRole: cfg.DefaultRole,
+		OnReconnect:        cfg.OnReconnect,
+		MaxIdleTimeout:     cfg.MaxIdleTimeout,
 	})
 	if err != nil {
 		credStore.Close()
